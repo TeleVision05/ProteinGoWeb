@@ -259,7 +259,9 @@ async function loadModel(src) {
     const t1 = performance.now();
     status(`Parsing / decoding ${fmtBytes(bytes.byteLength)}…`);
     const base = src.url ? src.url.slice(0, src.url.lastIndexOf('/') + 1) : '';
-    const gltf = await loader.parseAsync(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength), base);
+    // Avoid a second copy of the file when the view already spans its whole buffer (matters for GB-sized models).
+    const whole = bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength;
+    const gltf = await loader.parseAsync(whole ? bytes.buffer : bytes.slice().buffer, base);
     const t2 = performance.now();
 
     const template = gltf.scene;
@@ -866,14 +868,24 @@ window.lab = { THREE, renderer, scene, state, perf, loadModel };
 
 (async () => {
   checkXR();
-  let models = [];
-  try {
-    models = await (await fetch('models/models.json', { cache: 'no-store' })).json();
-  } catch (e) {
-    perf.log(`Could not read models/models.json: ${e.message}`, 'warn');
-  }
+  // models.json is deployed; models.local.json only exists on the dev machine (originals + files >100 MB).
+  const readList = async (url) => {
+    try {
+      const res = await fetch(url, { cache: 'no-store' });
+      return res.ok ? await res.json() : [];
+    } catch { return []; }
+  };
+  const [deployed, local] = await Promise.all([readList('models/models.json'), readList('models/models.local.json')]);
+  const models = [...deployed, ...local];
+  if (!models.length) perf.log('No entries in models/models.json', 'warn');
   const sel = $('modelSelect');
-  for (const m of models) sel.add(new Option(m.name, m.url));
+  for (const [label, list] of [['Optimized', deployed], ['Local only (originals / >100 MB)', local]]) {
+    if (!list.length) continue;
+    const group = document.createElement('optgroup');
+    group.label = label;
+    for (const m of list) group.append(new Option(m.name, m.url));
+    sel.append(group);
+  }
   const wanted = params.get('model');
   if (wanted && !models.some((m) => m.url === wanted)) sel.add(new Option(wanted, wanted));
   if (wanted) sel.value = wanted;

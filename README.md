@@ -56,10 +56,16 @@ Controls: `−`/`+` size, `⟳` rotate, `1:1` file units as metres, `+copy`/`−
 
 ```bash
 npm install                                      # once (needs Node 20+)
-npm run add-model -- "C:/path/to/thing.glb" "Thing"
+npm run add-model -- "C:/path/to/thing.glb" "Thing"                  # meshopt + Draco variants
+npm run add-model -- "C:/path/to/huge.glb" "Huge" --meshopt-only      # skip Draco for multi-GB files
 ```
 
-This copies the source into `models/src/`, writes `-meshopt` and `-draco` variants, and registers all three in `models/models.json`. You can also open any `.glb` directly with the file picker without converting it.
+This hard-links the source into `models/src/`, writes the optimized variants, and registers them in one of two lists:
+
+- `models/models.json`: committed and deployed. Optimized files under GitHub's 100 MB file limit go here.
+- `models/models.local.json` (gitignored): only on the local `serve.py`. Originals, and any optimized file over 100 MB (stored in `models/local/`), go here.
+
+The model dropdown shows them as two groups, "Optimized" and "Local only". You can also open any `.glb` directly with the file picker without converting it.
 
 ## Research: making glTF fast in mobile WebXR
 

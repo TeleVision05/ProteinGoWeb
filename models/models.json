@@ -1,4 +1,38 @@
 [
-  { "name": "Actin–Myosin · meshopt+quantized (18 MB)", "url": "models/actin-myosin-meshopt.glb" },
-  { "name": "Actin–Myosin · Draco (4 MB)", "url": "models/actin-myosin-draco.glb" }
+  {
+    "name": "Actin–Myosin (Ribbon) · meshopt+quantized (0.8 MB)",
+    "url": "models/actin-myosin-ribbon-meshopt.glb"
+  },
+  {
+    "name": "Actin–Myosin (Ribbon) · Draco (0.5 MB)",
+    "url": "models/actin-myosin-ribbon-draco.glb"
+  },
+  {
+    "name": "Actin–Myosin (Sphere) · meshopt+quantized (17.4 MB)",
+    "url": "models/actin-myosin-sphere-meshopt.glb"
+  },
+  {
+    "name": "Actin–Myosin (Sphere) · Draco (3.8 MB)",
+    "url": "models/actin-myosin-sphere-draco.glb"
+  },
+  {
+    "name": "Hemoglobin (Sphere) · meshopt+quantized (6.8 MB)",
+    "url": "models/hemoglobin-sphere-meshopt.glb"
+  },
+  {
+    "name": "Hemoglobin (Sphere) · Draco (1.5 MB)",
+    "url": "models/hemoglobin-sphere-draco.glb"
+  },
+  {
+    "name": "Receptors (Sphere) · meshopt+quantized (8.4 MB)",
+    "url": "models/receptors-sphere-meshopt.glb"
+  },
+  {
+    "name": "Receptors (Sphere) · Draco (2.0 MB)",
+    "url": "models/receptors-sphere-draco.glb"
+  },
+  {
+    "name": "Hemoglobin (Sphere) HQ · meshopt+quantized (91.4 MB)",
+    "url": "models/hemoglobin-sphere-hq-meshopt.glb"
+  }
 ]
