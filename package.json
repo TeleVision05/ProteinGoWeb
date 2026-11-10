@@ -1,0 +1,16 @@
+{
+  "name": "glb-ar-lab",
+  "version": "1.0.0",
+  "private": true,
+  "description": "WebXR AR GLB viewer for testing mobile web 3D rendering limits",
+  "type": "module",
+  "scripts": {
+    "serve": "python serve.py",
+    "serve:http": "python serve.py --http",
+    "add-model": "node scripts/add-model.mjs",
+    "inspect": "gltf-transform inspect"
+  },
+  "devDependencies": {
+    "@gltf-transform/cli": "^4.5.1"
+  }
+}
