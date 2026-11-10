@@ -484,7 +484,7 @@ function updateSun() {
 
 let arSupported = false;
 
-// Resolves with the Variant Launch init payload, or null when the SDK isn't configured.
+// Resolves with the Variant Launch init payload, or null when the SDK isn't loaded (no key, or not iOS).
 function waitForVLaunch(timeoutMs = 6000) {
   return new Promise((resolve) => {
     const vl = window.__vlaunch;

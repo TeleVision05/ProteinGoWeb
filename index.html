@@ -13,7 +13,9 @@
     // The init event can fire before the main module runs, so its payload is stashed on window.
     (function () {
       var key = new URLSearchParams(location.search).get('vlkey') || (window.LAB_CONFIG || {}).variantLaunchKey;
-      if (!key) return;
+      // Only iOS needs it (Safari has no WebXR); Android Chrome uses its native WebXR directly.
+      var ios = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+      if (!key || !ios) return;
       window.__vlaunch = { status: 'loading' };
       var onInit = function (e) { window.__vlaunch = Object.assign({ status: 'ready' }, e.detail || {}); };
       window.addEventListener('vlaunch-initialized', onInit);
