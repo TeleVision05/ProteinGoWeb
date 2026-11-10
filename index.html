@@ -7,6 +7,23 @@
   <title>GLB AR Lab</title>
   <link rel="icon" href="data:,">
   <link rel="stylesheet" href="src/style.css">
+  <script src="src/config.js"></script>
+  <script>
+    // Variant Launch (WebXR on iOS via App Clip). Loaded early, and only when a key is configured.
+    // The init event can fire before the main module runs, so its payload is stashed on window.
+    (function () {
+      var key = new URLSearchParams(location.search).get('vlkey') || (window.LAB_CONFIG || {}).variantLaunchKey;
+      if (!key) return;
+      window.__vlaunch = { status: 'loading' };
+      var onInit = function (e) { window.__vlaunch = Object.assign({ status: 'ready' }, e.detail || {}); };
+      window.addEventListener('vlaunch-initialized', onInit);
+      document.addEventListener('vlaunch-initialized', onInit);
+      var s = document.createElement('script');
+      s.src = 'https://launchar.app/sdk/v1?key=' + encodeURIComponent(key);
+      s.onerror = function () { window.__vlaunch = { status: 'error' }; };
+      document.head.appendChild(s);
+    })();
+  </script>
   <script type="importmap">
     {
       "imports": {

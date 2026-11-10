@@ -21,7 +21,16 @@ python serve.py --http     # HTTP on :8000 (desktop, or phone via USB port forwa
 2. On the PC open `chrome://inspect` → **Port forwarding** → `8000` → `localhost:8000`.
 3. On the phone open `http://localhost:8000`. Localhost counts as a secure context, so WebXR works without HTTPS. The console, performance panel and `window.lab` debug handle are then available from `chrome://inspect`.
 
-Platform note: WebXR `immersive-ar` + hit-test works in **Chrome on ARCore Android phones**. iOS Safari does not expose WebXR AR (Apple routes web AR through AR Quick Look/USDZ instead), so on iPhone this page only runs in preview mode.
+Platform note: WebXR `immersive-ar` + hit-test works natively in **Chrome on ARCore Android phones**. iOS Safari has no WebXR, so iPhone AR goes through **Variant Launch** (below); without it, iPhone only gets preview mode.
+
+### iPhone via Variant Launch
+[Variant Launch](https://launch.variant3d.com/) opens the page inside an App Clip that provides WebXR (ARKit tracking, hit-test, anchors, DOM overlay), so the same code runs on iPhone.
+
+1. Create an account at https://launchar.app/register, create a project, and copy its SDK key (the free Developer tier allows 3,000 views/month).
+2. Put the key in `src/config.js` (`variantLaunchKey`), or append `?vlkey=KEY` to the URL to try it out.
+3. On iPhone Safari the button becomes **Open AR viewer (iPhone)**. Tap it, then **Open** on the App Clip card, and the page reloads inside the viewer with the same model.
+
+iOS only accepts a real SSL certificate, so test with the GitHub Pages URL or a tunnel (`cloudflared tunnel --url http://localhost:8000`), not the self-signed `serve.py` cert. On iPhone the stats measure WebGL inside Variant's viewer, so they're close to Safari but not identical, and they aren't directly comparable with Android Chrome.
 
 ## Using it
 

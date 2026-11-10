@@ -131,6 +131,7 @@ const state = {
   trackingLost: 0,
   wasTracking: true,
   frameCount: 0,
+  launchRequired: false,
   exiting: false,
   menuFrame: true,
 };
@@ -316,7 +317,7 @@ async function loadModel(src) {
     );
     perf.log(`Loaded ${name}: ${fmtBytes(bytes.byteLength)}, ${fmtNum(stats.triangles)} tris, geom ${fmtBytes(stats.geoBytes)}, ` +
       `download ${(t1 - t0).toFixed(0)} ms, decode ${(t2 - t1).toFixed(0)} ms, compile ${(t4 - t3).toFixed(0)} ms [${ext.join(', ') || 'no ext'}]`);
-    $('enterAR').disabled = !arSupported;
+    updateEnterButton();
   } catch (e) {
     status(`Failed to load ${name}:\n${e.message}`);
     perf.log(`Load failed: ${e.stack || e.message}`, 'error');
@@ -483,8 +484,41 @@ function updateSun() {
 
 let arSupported = false;
 
+// Resolves with the Variant Launch init payload, or null when the SDK isn't configured.
+function waitForVLaunch(timeoutMs = 6000) {
+  return new Promise((resolve) => {
+    const vl = window.__vlaunch;
+    if (!vl) return resolve(null);
+    if (vl.status !== 'loading') return resolve(vl);
+    const done = () => resolve(window.__vlaunch);
+    const onInit = () => setTimeout(done); // let the head script's listener store the payload first
+    addEventListener('vlaunch-initialized', onInit, { once: true });
+    document.addEventListener('vlaunch-initialized', onInit, { once: true });
+    setTimeout(done, timeoutMs);
+  });
+}
+
+function updateEnterButton() {
+  const btn = $('enterAR');
+  btn.textContent = state.launchRequired ? 'Open AR viewer (iPhone)' : 'Enter AR';
+  btn.disabled = !state.model || !(arSupported || state.launchRequired);
+}
+
 async function checkXR() {
   const el = $('xrSupport');
+  const vl = await waitForVLaunch();
+  if (vl) {
+    perf.log(`Variant Launch: ${vl.status}${vl.webXRStatus ? `, webXRStatus=${vl.webXRStatus}` : ''}`, vl.status === 'ready' ? 'info' : 'warn');
+    if (vl.status !== 'ready') perf.log('Variant Launch did not initialize: check the SDK key in src/config.js and the project\'s allowed domains', 'warn');
+    perf.set('Device', { 'webxr via': vl.webXRStatus === 'supported' && !navigator.userAgent.includes('Android') ? 'Variant Launch' : 'browser' });
+    if (vl.webXRStatus === 'launch-required') {
+      // iOS Safari: AR has to continue inside the Variant Launch App Clip, which reloads this page there.
+      state.launchRequired = true;
+      el.textContent = 'iPhone: AR opens in the Variant Launch App Clip. Tap the button, then "Open" on the card. Pick the model first; local files do not carry over.';
+      updateEnterButton();
+      return;
+    }
+  }
   if (!window.isSecureContext) {
     el.textContent = 'Not a secure context: WebXR needs HTTPS (or localhost via USB port forwarding).';
     return;
@@ -496,8 +530,15 @@ async function checkXR() {
   try { arSupported = await navigator.xr.isSessionSupported('immersive-ar'); } catch { arSupported = false; }
   el.textContent = arSupported ? 'immersive-ar supported ✓' : 'immersive-ar NOT supported on this device/browser. Preview mode still works.';
   perf.log(`immersive-ar supported: ${arSupported}`);
-  if (state.model) $('enterAR').disabled = !arSupported;
+  updateEnterButton();
 }
+
+addEventListener('vlaunch-ar-tracking', (e) => {
+  const d = e.detail || {};
+  const s = d.state ?? d.trackingState ?? JSON.stringify(d);
+  perf.log(`ARKit tracking: ${s}`, String(s).startsWith('normal') ? 'info' : 'warn');
+  perf.set('Tracking', { arkit: s });
+});
 
 async function startAR() {
   if (!state.model) return;
@@ -505,7 +546,7 @@ async function startAR() {
   try {
     session = await navigator.xr.requestSession('immersive-ar', {
       requiredFeatures: ['hit-test'],
-      optionalFeatures: ['dom-overlay', 'anchors', 'local-floor'],
+      optionalFeatures: ['local', 'dom-overlay', 'anchors', 'local-floor'],
       domOverlay: { root: $('overlay') },
     });
   } catch (e) {
@@ -515,7 +556,9 @@ async function startAR() {
   }
 
   const fbSel = $('fbScale').value;
-  const fbScale = fbSel === 'native' ? XRWebGLLayer.getNativeFramebufferScaleFactor(session) : parseFloat(fbSel);
+  const nativeScale = typeof XRWebGLLayer.getNativeFramebufferScaleFactor === 'function'
+    ? XRWebGLLayer.getNativeFramebufferScaleFactor(session) : 1;
+  const fbScale = fbSel === 'native' ? nativeScale : parseFloat(fbSel);
   const foveation = parseFloat($('foveation').value);
   renderer.xr.setReferenceSpaceType('local');
   renderer.xr.setFramebufferScaleFactor(fbScale);
@@ -817,7 +860,12 @@ function benchMeta() {
   };
 }
 
-$('enterAR').addEventListener('click', startAR);
+$('enterAR').addEventListener('click', () => {
+  if (!state.launchRequired) { startAR(); return; }
+  const url = window.VLaunch?.getLaunchUrl?.(location.href) || window.__vlaunch?.launchUrl;
+  perf.log(`Opening Variant Launch viewer: ${url}`);
+  if (url) location.href = url;
+});
 $('preview').addEventListener('click', () => { setMode('preview'); perf.resetTiming(); });
 $('btnExit').addEventListener('click', () => { if (state.session) exitAR(); else { setMode('menu'); requestMenuFrame(); } });
 
