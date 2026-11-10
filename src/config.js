@@ -3,5 +3,5 @@ window.LAB_CONFIG = {
   // Variant Launch SDK key: enables WebXR AR on iPhone through an App Clip.
   // Get one at https://launchar.app/register (free Developer tier: 3,000 views/month).
   // Leave empty to disable. Can also be passed as ?vlkey=... for testing.
-  variantLaunchKey: '',
+  variantLaunchKey: 'UDPeXAqcBoVnDMP6L400GkAGBqEnS1XJ',
 };
