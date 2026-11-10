@@ -114,3 +114,13 @@ body.mode-preview .ar-only { display: none; }
 }
 #controls button { font-size: 12px; padding: 6px 4px; min-height: 40px; background: rgba(35,41,51,.85); }
 #controls button.on { background: rgba(31,58,49,.9); }
+
+#crashBox {
+  margin: 0 0 12px; padding: 10px; white-space: pre-wrap; word-break: break-word;
+  background: rgba(242, 102, 91, 0.12); border: 1px solid rgba(242, 102, 91, 0.5); border-radius: 8px;
+  color: var(--text);
+}
+#fatal {
+  position: fixed; inset: 0; z-index: 20; display: flex; align-items: center; justify-content: center;
+  padding: 16px; background: rgba(10, 12, 15, 0.85);
+}

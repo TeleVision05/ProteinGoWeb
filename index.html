@@ -23,6 +23,7 @@
     <div class="card">
       <h1>GLB AR Lab</h1>
       <p class="sub">WebXR floor placement + rendering stress test</p>
+      <pre id="crashBox" class="mono small hidden"></pre>
 
       <section>
         <label class="field">Model
@@ -83,6 +84,15 @@
       <button id="btnLog">Log</button>
       <button id="btnBench" class="accent">Bench 10s</button>
       <button id="btnReport">Report</button>
+    </div>
+  </div>
+
+  <!-- Shown if the GPU drops the WebGL context (usually out of memory). -->
+  <div id="fatal" class="hidden">
+    <div class="card">
+      <h1>GPU context lost</h1>
+      <p class="sub">The phone ran out of GPU memory or reset the GPU. The log was saved and will be shown after reload.</p>
+      <button id="reload" class="primary">Reload</button>
     </div>
   </div>
 

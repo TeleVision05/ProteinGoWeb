@@ -15,6 +15,7 @@ export const fmtNum = (n) => {
 };
 const pct = (sorted, p) => sorted.length ? sorted[Math.min(sorted.length - 1, Math.floor(p * sorted.length))] : NaN;
 const avg = (a) => a.length ? a.reduce((s, v) => s + v, 0) / a.length : NaN;
+const CRUMB_KEY = 'glbArLab.crumb';
 const esc = (s) => String(s).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
 
 // GPU time via EXT_disjoint_timer_query_webgl2. Often unavailable on mobile; reports n/a then.
@@ -92,6 +93,18 @@ export class PerfMonitor {
     this.remoteEnabled = true;
     this.streamStats = true;
     this.t0 = performance.now();
+    this.context = {};
+
+    // Crash breadcrumbs: state is mirrored to localStorage and marked clean on a normal page exit.
+    // If the next load finds it still dirty, the tab crashed (or was killed) and we report it.
+    this.previousCrash = null;
+    try {
+      const prev = JSON.parse(localStorage.getItem(CRUMB_KEY) || 'null');
+      if (prev && !prev.clean) this.previousCrash = prev;
+    } catch { /* storage blocked */ }
+    this.persistCrumb();
+    addEventListener('pagehide', () => this.persistCrumb(true));
+    setInterval(() => this.persistCrumb(), 2000);
 
     setInterval(() => this.renderHud(), 250);
     setInterval(() => this.flushRemote(), 2000);
@@ -241,6 +254,27 @@ export class PerfMonitor {
     ctx.fillText('33.3', 2, H - (33.33 / maxMs) * H - 2);
   }
 
+  // ---------- crash breadcrumbs ----------
+
+  setContext(values) {
+    Object.assign(this.context, values);
+    this.persistCrumb();
+  }
+
+  persistCrumb(clean = false) {
+    try {
+      const L = this.count ? this.live() : {};
+      localStorage.setItem(CRUMB_KEY, JSON.stringify({
+        clean,
+        time: Date.now(),
+        context: this.context,
+        live: { fps: L.fps, msAvg: L.msAvg, triangles: this.counters.triangles, calls: this.counters.calls,
+          heap: performance.memory?.usedJSHeapSize ?? null },
+        logs: this.logs.slice(-30),
+      }));
+    } catch { /* storage blocked or full */ }
+  }
+
   // ---------- log ----------
 
   log(msg, level = 'info') {
@@ -255,6 +289,7 @@ export class PerfMonitor {
     this.logEl.prepend(line);
     while (this.logEl.childElementCount > 150) this.logEl.lastChild.remove();
     this.remoteQueue.push(entry);
+    if (level !== 'info') this.persistCrumb(); // keep the latest warning/error in case the next thing is a crash
   }
 
   queueStatLine() {

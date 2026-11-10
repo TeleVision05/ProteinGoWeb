@@ -131,6 +131,8 @@ const state = {
   trackingLost: 0,
   wasTracking: true,
   frameCount: 0,
+  exiting: false,
+  menuFrame: true,
 };
 
 const tmpM = new THREE.Matrix4();
@@ -273,7 +275,8 @@ async function loadModel(src) {
     template.traverse((o) => { if (o.isMesh) origMat.set(o, o.material); });
 
     const stats = analyze(template);
-    state.model = { name, template, variants: new Map(), clips: gltf.animations, size, footprint: Math.max(size.x, size.z), stats };
+    perf.setContext({ model: name });
+  state.model = { name, template, variants: new Map(), clips: gltf.animations, size, footprint: Math.max(size.x, size.z), stats };
     rebuildInstances();
     applyMaterialMode();
     applyShadowMode();
@@ -282,6 +285,7 @@ async function loadModel(src) {
     const t3 = performance.now();
     await renderer.compileAsync(scene, camera);
     const t4 = performance.now();
+    requestMenuFrame();
 
     const ext = gltf.parser.json.extensionsUsed || [];
     perf.set('Model', {
@@ -519,7 +523,9 @@ async function startAR() {
   await renderer.xr.setSession(session);
 
   state.session = session;
+  state.exiting = false;
   state.refSpace = renderer.xr.getReferenceSpace();
+  perf.setContext({ fbScale, foveation });
   state.placed = false;
   state.locked = false;
   state.trackingLost = 0;
@@ -571,25 +577,68 @@ async function startAR() {
   setHint('Point at the floor and move the phone slowly…');
 }
 
-function onSessionEnd() {
-  perf.log(`AR session ended (tracking lost ${state.trackingLost}×, anchor corrections ${state.anchorCorrections})`);
-  state.anchor?.delete?.();
-  Object.assign(state, { session: null, hitTestSource: null, anchor: null, lastHit: null, placed: false });
+// Run one teardown step; a failure is logged but never aborts the rest of the cleanup.
+function safe(label, fn) {
+  try { fn(); } catch (e) { perf.log(`${label} failed: ${e.message}`, 'warn'); }
+}
+
+// Release XR resources we own while the session is still alive, then end it.
+function exitAR() {
+  const session = state.session;
+  if (!session) { setMode('menu'); return; }
+  if (state.exiting) return;
+  state.exiting = true;
+  perf.log(`Exit requested${performance.memory ? ` (heap ${fmtBytes(performance.memory.usedJSHeapSize)})` : ''}`);
+  anchorGroup.visible = false; // keep the last AR frames cheap
   reticle.visible = false;
-  anchorGroup.matrix.identity();
-  anchorGroup.visible = true;
-  scene.background = previewBg;
-  grid.visible = true;
-  controls.enabled = true;
-  perf.targetHz = 60;
-  perf.clear('XR');
-  perf.clear('Tracking');
+  safe('hit-test cancel', () => state.hitTestSource?.cancel());
+  safe('anchor delete', () => state.anchor?.delete());
+  state.hitTestSource = null;
+  state.anchor = null;
+  session.end().catch((e) => {
+    perf.log(`session.end() rejected: ${e.message}`, 'warn');
+    onSessionEnd();
+  });
+  // Watchdog: if the browser never fires 'end', clean up anyway so the UI can't get stuck.
+  setTimeout(() => {
+    if (state.session === session) {
+      perf.log('No session end event after 2 s, forcing cleanup', 'warn');
+      onSessionEnd();
+    }
+  }, 2000);
+}
+
+function onSessionEnd() {
+  if (!state.session) return; // already cleaned up (watchdog or rejection path)
+  perf.log(`AR session ended (tracking lost ${state.trackingLost}×, anchor corrections ${state.anchorCorrections})`);
+  safe('hit-test cancel', () => state.hitTestSource?.cancel());
+  safe('anchor delete', () => state.anchor?.delete());
+  Object.assign(state, { session: null, exiting: false, hitTestSource: null, anchor: null, lastHit: null, placed: false });
+  safe('scene reset', () => {
+    reticle.visible = false;
+    anchorGroup.matrix.identity();
+    anchorGroup.visible = true;
+    scene.background = previewBg;
+    grid.visible = true;
+    controls.enabled = true;
+  });
+  safe('stats reset', () => {
+    perf.targetHz = 60;
+    perf.clear('XR');
+    perf.clear('Tracking');
+    perf.resetTiming();
+  });
   $('btnFps').classList.add('hidden');
-  perf.resetTiming();
   setHint('');
   setMode('menu');
-  onResize();
-  updateScaleInfo();
+  // Give the browser time to tear down the camera + XR buffers before drawing the heavy scene
+  // again; drawing straight away is when phones run out of GPU memory.
+  setTimeout(() => {
+    safe('resize', onResize);
+    safe('reframe', updateScaleInfo);
+    requestMenuFrame();
+    perf.log('Back in page mode');
+  }, 600);
 }
 
 function onSelect() {
@@ -703,7 +752,16 @@ function updateXR(frame) {
 // Render loop
 // ---------------------------------------------------------------------------
 
+// While the menu card is open the 3D view is just a backdrop: draw it once instead of every frame.
+// Saves battery and leaves GPU headroom right after leaving AR.
+function requestMenuFrame() { state.menuFrame = true; }
+
 function onFrame(t, frame) {
+  if (state.mode === 'menu' && !state.session) {
+    if (!state.menuFrame) return;
+    state.menuFrame = false;
+    perf.resetTiming();
+  }
   perf.frameBegin(t);
   state.frameCount++;
   timer.update(t);
@@ -727,6 +785,7 @@ function onResize() {
   camera.aspect = innerWidth / innerHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(innerWidth, innerHeight);
+  requestMenuFrame();
 }
 addEventListener('resize', onResize);
 
@@ -736,6 +795,7 @@ addEventListener('resize', onResize);
 
 function setMode(mode) {
   state.mode = mode;
+  perf.setContext({ mode });
   document.body.className = `mode-${mode}`;
   $('btnExit').textContent = mode === 'ar' ? 'Exit AR' : 'Menu';
 }
@@ -759,7 +819,7 @@ function benchMeta() {
 
 $('enterAR').addEventListener('click', startAR);
 $('preview').addEventListener('click', () => { setMode('preview'); perf.resetTiming(); });
-$('btnExit').addEventListener('click', () => (state.session ? state.session.end() : setMode('menu')));
+$('btnExit').addEventListener('click', () => { if (state.session) exitAR(); else { setMode('menu'); requestMenuFrame(); } });
 
 $('btnMove').addEventListener('click', () => {
   state.locked = !state.locked;
@@ -857,7 +917,15 @@ $('modelSelect').addEventListener('change', (e) => {
 
 window.addEventListener('error', (e) => perf.log(`JS error: ${e.message}`, 'error'));
 window.addEventListener('unhandledrejection', (e) => perf.log(`Unhandled rejection: ${e.reason?.message || e.reason}`, 'error'));
-renderer.domElement.addEventListener('webglcontextlost', () => perf.log('WebGL context LOST (likely out of GPU memory)', 'error'));
+renderer.domElement.addEventListener('webglcontextlost', (e) => {
+  e.preventDefault(); // allows the browser to restore the context
+  perf.log('WebGL context LOST (likely out of GPU memory)', 'error');
+  $('fatal').classList.remove('hidden');
+});
+renderer.domElement.addEventListener('webglcontextrestored', () => {
+  perf.log('WebGL context restored; reload recommended', 'warn');
+});
+$('reload').addEventListener('click', () => location.reload());
 
 // Debug handle for remote DevTools (chrome://inspect).
 window.lab = { THREE, renderer, scene, state, perf, loadModel };
@@ -867,6 +935,20 @@ window.lab = { THREE, renderer, scene, state, perf, loadModel };
 // ---------------------------------------------------------------------------
 
 (async () => {
+  const crash = perf.previousCrash;
+  if (crash) {
+    const L = crash.live || {};
+    const box = $('crashBox');
+    box.textContent = [
+      `Last session didn't close cleanly (tab crash or killed) at ${new Date(crash.time).toLocaleTimeString()}.`,
+      `mode ${crash.context.mode ?? '?'} · ${crash.context.model ?? 'no model'} · fb ${crash.context.fbScale ?? '-'}`,
+      `last: ${L.fps?.toFixed?.(1) ?? '?'} fps · ${fmtNum(L.triangles)} tris · heap ${fmtBytes(L.heap)}`,
+      'last log:',
+      ...crash.logs.slice(-6).map((l) => `  ${l.t}s ${l.msg}`),
+    ].join('\n');
+    box.classList.remove('hidden');
+    perf.log(`Previous session crashed: ${JSON.stringify({ context: crash.context, live: crash.live, lastLogs: crash.logs.slice(-15) })}`, 'warn');
+  }
   checkXR();
   // models.json is deployed; models.local.json only exists on the dev machine (originals + files >100 MB).
   const readList = async (url) => {
