@@ -1,0 +1,59 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --font-sans: "Figtree", ui-sans-serif, system-ui, sans-serif;
+  --font-display: "Fraunces", ui-serif, Georgia, serif;
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-gold: #e0a100;
+  --color-campus: #04284d;
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+}
+
+:root {
+  --radius: 0.75rem;
+  --background: #f6f3ec;
+  --foreground: #1c2430;
+  --card: #fffdf8;
+  --card-foreground: #1c2430;
+  --primary: #04284d;
+  --primary-foreground: #f6f3ec;
+  --secondary: #efe8d8;
+  --secondary-foreground: #1c2430;
+  --muted: #efe8d8;
+  --muted-foreground: #5c6570;
+  --accent: #efe8d8;
+  --accent-foreground: #1c2430;
+  --destructive: #9f2d2d;
+  --border: #e2d9c8;
+  --input: #e2d9c8;
+  --ring: #04284d;
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background font-sans text-foreground antialiased;
+  }
+}

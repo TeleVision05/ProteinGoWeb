@@ -1,6 +1,6 @@
 node_modules/
-.cert/
-reports/
-models/src/
-models/local/
-models/models.local.json
+.DS_Store
+.env
+apps/server/uploads/
+dist/
+*.tsbuildinfo

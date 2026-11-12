@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.env
+.DS_Store
+public/ar/node_modules/
+public/ar/.cert/
+public/ar/reports/
+public/ar/models/src/
+public/ar/models/local/
+public/ar/models/models.local.json

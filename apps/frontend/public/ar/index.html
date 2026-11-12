@@ -42,6 +42,7 @@
     <div class="card">
       <h1>GLB AR Lab</h1>
       <p class="sub">WebXR floor placement + rendering stress test</p>
+      <p class="sub"><a id="backToMap" href="/" hidden>Back to map</a></p>
       <pre id="crashBox" class="mono small hidden"></pre>
 
       <section>
@@ -115,6 +116,11 @@
     </div>
   </div>
 
+  <script>
+    if (new URLSearchParams(location.search).get('from') === 'map') {
+      document.getElementById('backToMap').hidden = false;
+    }
+  </script>
   <script type="module" src="src/main.js"></script>
 </body>
 </html>
