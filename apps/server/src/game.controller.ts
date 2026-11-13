@@ -29,6 +29,7 @@ import {
   updateSpawn,
   type ModelUpload,
 } from './game';
+import { devAccountList, devBypassEnabled, devCookie, devUser, isDevRole } from './dev-auth';
 import { r2Configured } from './storage';
 
 type FieldPart = { type: 'field'; fieldname: string; value: string };
@@ -83,7 +84,28 @@ export class GameController {
       ok: true,
       storage: r2Configured() ? 'r2' : 'local',
       google: Boolean(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET),
+      // Only present when DEV_BYPASS_AUTH is on: the login page offers these instead of Google.
+      devAccounts: devAccountList(),
     };
+  }
+
+  @Post('dev/login')
+  async devLogin(
+    @Body() body: { role?: string },
+    @Req() request: FastifyRequest,
+    @Res({ passthrough: true }) reply: FastifyReply,
+  ) {
+    if (!devBypassEnabled()) throw new GameError('Dev sign-in is off.', 404);
+    if (!isDevRole(body.role)) throw new GameError('Pick a dev account.', 400);
+    await devUser(body.role); // make sure the row exists
+    reply.header('Set-Cookie', devCookie(body.role, request.protocol === 'https'));
+    return { ok: true, role: body.role };
+  }
+
+  @Post('dev/logout')
+  devLogout(@Req() request: FastifyRequest, @Res({ passthrough: true }) reply: FastifyReply) {
+    reply.header('Set-Cookie', devCookie(null, request.protocol === 'https'));
+    return { ok: true };
   }
 
   @Get('me')

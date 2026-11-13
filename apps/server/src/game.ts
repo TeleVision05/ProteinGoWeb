@@ -188,7 +188,8 @@ function assertGlb(file: ModelUpload) {
 async function storeModel(spawnId: string, file: ModelUpload | null, previousKey: string | null) {
   if (!file) return { modelKey: previousKey, modelFilename: null as string | null };
   assertGlb(file);
-  const key = `proteins/${spawnId}.glb`;
+  // A new key per upload: the model URL carries it, so phones never reuse a cached older model.
+  const key = `proteins/${spawnId}-${Date.now()}.glb`;
   await putModel(key, file.data, 'model/gltf-binary');
   if (previousKey && previousKey !== key) await deleteModel(previousKey).catch(() => undefined);
   return { modelKey: key, modelFilename: file.filename };
@@ -205,7 +206,7 @@ function presentSpawn(row: typeof spawn.$inferSelect, caught: boolean) {
     expiresAt: row.expiresAt?.toISOString() ?? null,
     createdAt: row.createdAt.toISOString(),
     hasModel: Boolean(row.modelKey),
-    modelUrl: row.modelKey ? `/api/models/${row.id}` : null,
+    modelUrl: row.modelKey ? `/api/models/${row.id}?v=${encodeURIComponent(row.modelKey)}` : null,
     modelFilename: row.modelFilename,
     caught,
   };

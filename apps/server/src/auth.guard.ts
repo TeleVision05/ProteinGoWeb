@@ -2,6 +2,7 @@ import { CanActivate, ExecutionContext, Injectable, UnauthorizedException } from
 import { fromNodeHeaders } from 'better-auth/node';
 import type { FastifyRequest } from 'fastify';
 import { auth } from './auth';
+import { devBypassEnabled, devUser, readDevRole } from './dev-auth';
 import { GameError, getAccess, isAdminEmail } from './game';
 
 export type SessionUser = {
@@ -17,6 +18,13 @@ export type AuthedRequest = FastifyRequest & { user: SessionUser };
 export class AuthGuard implements CanActivate {
   async canActivate(context: ExecutionContext) {
     const request = context.switchToHttp().getRequest<AuthedRequest>();
+    if (devBypassEnabled()) {
+      const role = readDevRole(request);
+      if (role) {
+        request.user = await devUser(role);
+        return true;
+      }
+    }
     const session = await auth.api.getSession({
       headers: fromNodeHeaders(request.headers),
     });
