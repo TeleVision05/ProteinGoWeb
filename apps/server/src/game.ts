@@ -1,7 +1,7 @@
 import { and, desc, eq, gt, isNull, or, sql } from 'drizzle-orm';
 import { db } from './db/db';
 import { accessCode, capture, codeRedemption, spawn } from './db/game-schema';
-import { deleteModel, putModel, readModel } from './storage';
+import { deleteModel, putModel, readBundledModel, readModel } from './storage';
 
 export class GameError extends Error {
   constructor(
@@ -354,7 +354,7 @@ export async function catchSpawn(input: { userId: string; spawnId: string; latit
 export async function readSpawnModel(id: string) {
   const [row] = await db.select().from(spawn).where(eq(spawn.id, id));
   if (!row?.modelKey) throw new GameError('This protein has no model yet.', 404);
-  const body = await readModel(row.modelKey);
+  const body = (await readModel(row.modelKey)) ?? (await readBundledModel(row.modelFilename));
   if (!body) throw new GameError('The model file is missing.', 404);
   return { filename: row.modelFilename ?? 'protein.glb', body };
 }

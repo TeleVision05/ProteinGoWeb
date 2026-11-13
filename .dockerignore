@@ -1,0 +1,11 @@
+**/node_modules
+**/dist
+**/.env
+**/.env.*
+!**/.env.example
+.git
+.cert
+models
+apps/server/uploads
+# The 96 MB source-quality model is not in the model list and would bloat the image.
+apps/frontend/public/ar/models/*-hq-*.glb

@@ -8,6 +8,8 @@ import type { FastifyReply, FastifyRequest } from 'fastify';
 import { AppModule } from './app.module';
 import { handleAuthRequest } from './auth.controller';
 import { GameErrorFilter } from './game-error.filter';
+import { serveFrontend } from './frontend';
+import { webOrigin } from './public-url';
 
 async function bootstrap() {
   const app = await NestFactory.create<NestFastifyApplication>(
@@ -15,7 +17,7 @@ async function bootstrap() {
     new FastifyAdapter({ trustProxy: true }),
   );
   await app.register(cors, {
-    origin: process.env.WEB_ORIGIN ?? 'http://localhost:5173',
+    origin: webOrigin(),
     credentials: true,
     methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
   });
@@ -29,6 +31,7 @@ async function bootstrap() {
     url: '/api/auth/*',
     handler: (request: FastifyRequest, reply: FastifyReply) => handleAuthRequest(request, reply),
   });
+  await serveFrontend(fastify);
   await app.listen(Number(process.env.PORT ?? 3001), '0.0.0.0');
 }
 

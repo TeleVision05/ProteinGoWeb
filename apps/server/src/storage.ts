@@ -67,6 +67,21 @@ export async function readModel(key: string) {
   }
 }
 
+/**
+ * Library models ship inside the app (frontend/ar/models), so a protein made from one still has its model after
+ * a redeploy even when uploads live on a disk that gets wiped. Only plain .glb names, never paths.
+ */
+export async function readBundledModel(filename: string | null) {
+  const dist = process.env.FRONTEND_DIST;
+  const name = filename ? path.basename(filename) : '';
+  if (!dist || !name.toLowerCase().endsWith('.glb')) return null;
+  try {
+    return await readFile(path.join(path.resolve(dist), 'ar', 'models', name));
+  } catch {
+    return null;
+  }
+}
+
 export async function deleteModel(key: string) {
   if (r2Configured()) {
     await client().send(
