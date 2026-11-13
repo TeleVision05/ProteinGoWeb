@@ -14,6 +14,7 @@ import type { FastifyReply, FastifyRequest } from 'fastify';
 import { AdminGuard, AuthGuard, AuthedRequest, PlayGuard } from './auth.guard';
 import {
   GameError,
+  catchAnywhere,
   catchSpawn,
   createCode,
   createSpawn,
@@ -116,6 +117,7 @@ export class GameController {
       user: request.user,
       isAdmin: isAdminEmail(request.user.email),
       access,
+      catchAnywhere: catchAnywhere(),
     };
   }
 
@@ -157,11 +159,13 @@ export class GameController {
   @Post('spawns/:id/catch')
   @UseGuards(AuthGuard, PlayGuard)
   catch(@Req() request: AuthedRequest, @Param('id') id: string, @Body() body: { latitude?: number; longitude?: number }) {
+    // With CATCH_ANYWHERE the location is optional (the app may not send one).
+    const anywhere = catchAnywhere();
     return catchSpawn({
       userId: request.user.id,
       spawnId: id,
-      latitude: requiredNumber(body.latitude, 'Latitude'),
-      longitude: requiredNumber(body.longitude, 'Longitude'),
+      latitude: anywhere && body.latitude == null ? undefined : requiredNumber(body.latitude, 'Latitude'),
+      longitude: anywhere && body.longitude == null ? undefined : requiredNumber(body.longitude, 'Longitude'),
     });
   }
 

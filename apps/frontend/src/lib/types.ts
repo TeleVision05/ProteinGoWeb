@@ -2,6 +2,8 @@ export type Me = {
   user: { id: string; name: string; email: string; image: string | null };
   isAdmin: boolean;
   access: { active: boolean; expiresAt: string | null; label: string | null };
+  /** Test switch: catching needs no location. */
+  catchAnywhere?: boolean;
 };
 
 export type Spawn = {

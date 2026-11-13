@@ -320,8 +320,14 @@ export async function deleteSpawn(id: string) {
   if (existing.modelKey) await deleteModel(existing.modelKey).catch(() => undefined);
 }
 
-export async function catchSpawn(input: { userId: string; spawnId: string; latitude: number; longitude: number }) {
-  assertCoordinates(input.latitude, input.longitude);
+/** TEMPORARY test switch: when CATCH_ANYWHERE=true, catching needs no location and no distance check. */
+export function catchAnywhere() {
+  return process.env.CATCH_ANYWHERE === 'true';
+}
+
+export async function catchSpawn(input: { userId: string; spawnId: string; latitude?: number; longitude?: number }) {
+  const anywhere = catchAnywhere();
+  if (!anywhere) assertCoordinates(input.latitude as number, input.longitude as number);
   const now = new Date();
   const [row] = await db
     .select()
@@ -333,8 +339,10 @@ export async function catchSpawn(input: { userId: string; spawnId: string; latit
     .from(capture)
     .where(and(eq(capture.spawnId, row.id), eq(capture.userId, input.userId)));
   if (already) return { caught: true, already: true };
-  const away = distanceMeters(input.latitude, input.longitude, row.latitude, row.longitude);
-  if (away > row.radiusMeters + GPS_TOLERANCE_METERS) {
+  const latitude = input.latitude ?? row.latitude;
+  const longitude = input.longitude ?? row.longitude;
+  const away = distanceMeters(latitude, longitude, row.latitude, row.longitude);
+  if (!anywhere && away > row.radiusMeters + GPS_TOLERANCE_METERS) {
     throw new GameError(
       `You are ${Math.round(away)} m away. Get within ${row.radiusMeters} m to catch it.`,
       400,
@@ -344,8 +352,8 @@ export async function catchSpawn(input: { userId: string; spawnId: string; latit
     id: crypto.randomUUID(),
     spawnId: row.id,
     userId: input.userId,
-    latitude: input.latitude,
-    longitude: input.longitude,
+    latitude,
+    longitude,
     caughtAt: now,
   });
   return { caught: true, already: false };

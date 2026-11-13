@@ -28,9 +28,9 @@ That is all: the database tables are created on start, and the app finds its own
 
 ### Using it
 
-- Sign in as **Dev admin**, open `/admin`, add a protein (pick a model from the library) **at your location**
-  (click the map where you are). Catching is checked on the server, so you have to be inside the protein's
-  radius, and at home that means placing the pin at your home.
+- Sign in as **Dev admin**, open `/admin` and add a protein (pick a model from the library). The test deployment
+  sets `CATCH_ANYWHERE=true`, so **catching needs no location** and works from anywhere. Remove that variable
+  to bring the distance check back.
 - Create a class code in `/admin`. Sign out, sign in as **Dev student**, redeem the code, then catch.
 - On Android, use Chrome. AR needs HTTPS (Render provides it) and Google Play Services for AR.
 

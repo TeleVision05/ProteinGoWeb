@@ -33,6 +33,9 @@ services:
         value: student@ucr.edu
       - key: ADMIN_EMAILS
         value: dev@ucr.edu
+      # TEMPORARY: catching needs no location, so it can be tested from anywhere. Remove for real use.
+      - key: CATCH_ANYWHERE
+        value: "true"
       # Create / update the database tables on every start (safe for a throwaway test database).
       - key: AUTO_DB_PUSH
         value: "true"

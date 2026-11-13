@@ -84,14 +84,14 @@ export function MapPage() {
   // Catching opens the AR view. Browsers only start AR right after a tap, so it opens immediately and the
   // catch result follows: if the server turns the catch down, AR closes again and the reason is shown.
   function catchSelected() {
-    if (!selected || !here) return;
+    if (!selected || (!here && !me?.catchAnywhere)) return;
     const spawn = selected;
     const opensAr = spawn.hasModel && modelReady;
     setPending(true);
     setActionError('');
     const request = api(`/api/spawns/${spawn.id}/catch`, {
       method: 'POST',
-      body: JSON.stringify({ latitude: here.lat, longitude: here.lng }),
+      body: JSON.stringify(here ? { latitude: here.lat, longitude: here.lng } : {}),
     });
     if (opensAr) ar.enter();
     request
@@ -201,7 +201,7 @@ export function MapPage() {
                     {modelLoading ? loadingLabel : 'View Model'}
                   </Button>
                 ) : (
-                  <Button disabled={pending || !inRange || modelLoading} onClick={catchSelected}>
+                  <Button disabled={pending || (!inRange && !me?.catchAnywhere) || modelLoading} onClick={catchSelected}>
                     {modelLoading ? loadingLabel : 'Catch'}
                   </Button>
                 )}
