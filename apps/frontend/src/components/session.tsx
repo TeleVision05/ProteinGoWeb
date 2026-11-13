@@ -1,3 +1,4 @@
+import { API_URL } from '@/lib/config';
 import { createContext, useCallback, useContext, useEffect, useState, type ReactNode } from 'react';
 import { Navigate } from 'react-router-dom';
 import { api } from '@/lib/api';
@@ -16,7 +17,7 @@ export function SessionProvider({ children }: { children: ReactNode }) {
   const [state, setState] = useState<SessionValue['state']>('loading');
 
   const refresh = useCallback(async () => {
-    const response = await fetch('/api/me', { credentials: 'include' });
+    const response = await fetch(`${API_URL}/api/me`, { credentials: 'include' });
     if (response.status === 401) {
       setMe(null);
       setState('anon');

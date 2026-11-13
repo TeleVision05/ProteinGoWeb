@@ -1,4 +1,5 @@
 import { BrowserRouter, Route, Routes } from 'react-router-dom';
+import { ArProvider } from '@/components/ar-provider';
 import { RequireAdmin, RequirePlay, RequireUser, SessionProvider } from '@/components/session';
 import { AdminPage } from '@/pages/admin-page';
 import { LoginPage } from '@/pages/login-page';
@@ -8,7 +9,8 @@ import { RedeemPage } from '@/pages/redeem-page';
 export function App() {
   return (
     <SessionProvider>
-      <BrowserRouter>
+      <ArProvider>
+      <BrowserRouter basename={import.meta.env.BASE_URL.replace(/\/$/, '')}>
         <Routes>
           <Route path="/login" element={<LoginPage />} />
           <Route
@@ -37,6 +39,7 @@ export function App() {
           />
         </Routes>
       </BrowserRouter>
+      </ArProvider>
     </SessionProvider>
   );
 }

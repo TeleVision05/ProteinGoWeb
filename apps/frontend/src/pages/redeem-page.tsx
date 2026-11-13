@@ -6,7 +6,7 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { redeem, useSession } from '@/components/session';
 import { ApiError } from '@/lib/api';
-import { authClient } from '@/lib/auth-client';
+import { signOutEverywhere } from '@/lib/auth-client';
 
 export function RedeemPage() {
   const { me, refresh } = useSession();
@@ -67,7 +67,7 @@ export function RedeemPage() {
             )}
             <button
               className="text-muted-foreground underline"
-              onClick={() => void authClient.signOut().then(() => window.location.assign('/login'))}
+              onClick={() => void signOutEverywhere()}
             >
               Sign out
             </button>

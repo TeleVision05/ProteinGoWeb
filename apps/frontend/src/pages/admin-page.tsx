@@ -18,8 +18,17 @@ function tomorrowEvening() {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
+const fileName = (url: string) => url.split('/').pop() ?? '';
+
+function toLocalInput(iso: string | null) {
+  if (!iso) return '';
+  const date = new Date(iso);
+  const pad = (value: number) => String(value).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
 export function AdminPage() {
-  const mapsKey = import.meta.env.VITE_GOOGLE_MAPS_API_KEY;
+  const mapboxToken = import.meta.env.VITE_MAPBOX_TOKEN;
   const [codes, setCodes] = useState<AccessCode[]>([]);
   const [spawns, setSpawns] = useState<Spawn[]>([]);
   const [error, setError] = useState('');
@@ -33,6 +42,17 @@ export function AdminPage() {
   const [spawnExpiry, setSpawnExpiry] = useState('');
   const [file, setFile] = useState<File | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [creating, setCreating] = useState(false);
+  const [library, setLibrary] = useState<{ name: string; url: string }[]>([]);
+  const [libraryUrl, setLibraryUrl] = useState('');
+
+  useEffect(() => {
+    fetch(`${import.meta.env.BASE_URL}ar/models/models.json`)
+      .then((response) => (response.ok ? response.json() : []))
+      .then((list: { name: string; url: string }[]) => setLibrary(list))
+      .catch(() => setLibrary([]));
+  }, []);
 
   async function load() {
     const [nextCodes, nextSpawns] = await Promise.all([
@@ -67,6 +87,37 @@ export function AdminPage() {
     }
   }
 
+  function startEdit(spawn: Spawn) {
+    setEditingId(spawn.id);
+    setSelectedId(spawn.id);
+    setName(spawn.name);
+    setSummary(spawn.summary ?? '');
+    setPoint({ lat: spawn.latitude, lng: spawn.longitude });
+    setRadius(String(spawn.radiusMeters));
+    setSpawnExpiry(toLocalInput(spawn.expiresAt));
+    setFile(null);
+    // Preselect the library entry this protein was made from (matched by file name).
+    setLibraryUrl(library.find((entry) => fileName(entry.url) === spawn.modelFilename)?.url ?? '');
+    setError('');
+  }
+
+  function startCreate() {
+    resetForm();
+    setPoint(UCR);
+    setCreating(true);
+  }
+
+  function resetForm() {
+    setEditingId(null);
+    setCreating(false);
+    setName('');
+    setSummary('');
+    setRadius('30');
+    setSpawnExpiry('');
+    setFile(null);
+    setLibraryUrl('');
+  }
+
   async function onSpawn(event: FormEvent) {
     event.preventDefault();
     setError('');
@@ -76,18 +127,113 @@ export function AdminPage() {
     body.set('latitude', String(point.lat));
     body.set('longitude', String(point.lng));
     body.set('radiusMeters', radius);
-    if (spawnExpiry) body.set('expiresAt', new Date(spawnExpiry).toISOString());
-    if (file) body.set('file', file);
+    body.set('expiresAt', spawnExpiry ? new Date(spawnExpiry).toISOString() : '');
     try {
-      await api('/api/admin/spawns', { method: 'POST', body });
-      setName('');
-      setSummary('');
-      setFile(null);
+      let upload = file;
+      const currentFile = editingId ? spawns.find((item) => item.id === editingId)?.modelFilename : null;
+      // Skip re-uploading when the selected library model is the one already attached.
+      if (!upload && libraryUrl && fileName(libraryUrl) !== currentFile) {
+        const response = await fetch(`${import.meta.env.BASE_URL}ar/${libraryUrl}`);
+        if (!response.ok) throw new ApiError('Could not load that library model.', response.status);
+        upload = new File([await response.blob()], libraryUrl.split('/').pop() ?? 'model.glb', {
+          type: 'model/gltf-binary',
+        });
+      }
+      if (upload) body.set('file', upload);
+      if (editingId) await api(`/api/admin/spawns/${editingId}`, { method: 'PATCH', body });
+      else await api('/api/admin/spawns', { method: 'POST', body });
+      resetForm();
       await load();
     } catch (caught) {
       setError(caught instanceof ApiError ? caught.message : 'Could not place that protein.');
     }
   }
+
+  const spawnEditor = (
+    <>
+            <div className="h-64 overflow-hidden rounded-lg border">
+              {mapboxToken ? (
+                <CampusMap
+                  token={mapboxToken}
+                  className="h-full w-full"
+                  user={null}
+                  spawns={spawns}
+                  selectedId={selectedId}
+                  draft={point}
+                  onSelect={setSelectedId}
+                  onPick={setPoint}
+                />
+              ) : (
+                <div className="grid h-full place-items-center px-4 text-center text-sm text-muted-foreground">
+                  Map key missing. Enter coordinates below.
+                </div>
+              )}
+            </div>
+            <p className="text-xs text-muted-foreground">Click the map to drop or move the pin.</p>
+            <form onSubmit={onSpawn} className="grid gap-3">
+              <div className="grid gap-2">
+                <Label htmlFor="name">Protein</Label>
+                <Input id="name" value={name} onChange={(event) => setName(event.target.value)} placeholder="Hemoglobin" required />
+              </div>
+              <div className="grid gap-2">
+                <Label htmlFor="summary">Note</Label>
+                <Input id="summary" value={summary} onChange={(event) => setSummary(event.target.value)} placeholder="South of the Bell Tower" />
+              </div>
+              <div className="grid gap-3 sm:grid-cols-3">
+                <div className="grid gap-2">
+                  <Label htmlFor="lat">Latitude</Label>
+                  <Input id="lat" value={point.lat} onChange={(event) => setPoint({ ...point, lat: Number(event.target.value) })} required />
+                </div>
+                <div className="grid gap-2">
+                  <Label htmlFor="lng">Longitude</Label>
+                  <Input id="lng" value={point.lng} onChange={(event) => setPoint({ ...point, lng: Number(event.target.value) })} required />
+                </div>
+                <div className="grid gap-2">
+                  <Label htmlFor="radius">Radius m</Label>
+                  <Input id="radius" type="number" min={5} max={250} step={1} value={radius} onChange={(event) => setRadius(event.target.value)} required />
+                </div>
+              </div>
+              <div className="grid gap-2">
+                <Label htmlFor="spawn-expires">Expires, optional</Label>
+                <Input id="spawn-expires" type="datetime-local" value={spawnExpiry} onChange={(event) => setSpawnExpiry(event.target.value)} />
+              </div>
+              <div className="grid gap-2">
+                <Label htmlFor="library">Model from library</Label>
+                <select
+                  id="library"
+                  value={libraryUrl}
+                  disabled={Boolean(file)}
+                  onChange={(event) => setLibraryUrl(event.target.value)}
+                  className="h-9 rounded-md border bg-background px-3 text-sm"
+                >
+                  <option value="">None</option>
+                  {library.map((entry) => (
+                    <option key={entry.url} value={entry.url}>
+                      {entry.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="grid gap-2">
+                <Label htmlFor="model">Or upload a GLB</Label>
+                <Input id="model" type="file" accept=".glb,model/gltf-binary" onChange={(event) => setFile(event.target.files?.[0] ?? null)} />
+              </div>
+              {editingId ? (
+                <p className="text-xs text-muted-foreground">
+                  Editing. Current model: {spawns.find((item) => item.id === editingId)?.modelFilename ?? 'none'}. Leave the model fields as they are to keep it.
+                </p>
+              ) : null}
+              <div className="flex gap-2">
+                <Button type="submit">{editingId ? 'Save changes' : 'Place on campus'}</Button>
+                {editingId ? (
+                  <Button type="button" variant="outline" onClick={resetForm}>
+                    Cancel
+                  </Button>
+                ) : null}
+              </div>
+            </form>
+    </>
+  );
 
   return (
     <main className="mx-auto grid max-w-6xl gap-6 px-4 py-8">
@@ -156,60 +302,22 @@ export function AdminPage() {
         <Card>
           <CardHeader>
             <CardTitle>Protein spawns</CardTitle>
-            <CardDescription>Click the map to drop a pin. Players catch inside the radius. No shops or vendor pins.</CardDescription>
+            <CardDescription>Players catch inside the radius. No shops or vendor pins.</CardDescription>
           </CardHeader>
           <CardContent className="grid gap-4">
             <div className="h-64 overflow-hidden rounded-lg border">
-              {mapsKey ? (
+              {mapboxToken ? (
                 <CampusMap
-                  apiKey={mapsKey}
+                  token={mapboxToken}
                   className="h-full w-full"
                   user={null}
                   spawns={spawns}
                   selectedId={selectedId}
-                  draft={point}
                   onSelect={setSelectedId}
-                  onPick={setPoint}
                 />
-              ) : (
-                <div className="grid h-full place-items-center px-4 text-center text-sm text-muted-foreground">
-                  Map key missing. Enter coordinates below.
-                </div>
-              )}
+              ) : null}
             </div>
-            <form onSubmit={onSpawn} className="grid gap-3">
-              <div className="grid gap-2">
-                <Label htmlFor="name">Protein</Label>
-                <Input id="name" value={name} onChange={(event) => setName(event.target.value)} placeholder="Hemoglobin" required />
-              </div>
-              <div className="grid gap-2">
-                <Label htmlFor="summary">Note</Label>
-                <Input id="summary" value={summary} onChange={(event) => setSummary(event.target.value)} placeholder="South of the Bell Tower" />
-              </div>
-              <div className="grid gap-3 sm:grid-cols-3">
-                <div className="grid gap-2">
-                  <Label htmlFor="lat">Latitude</Label>
-                  <Input id="lat" value={point.lat} onChange={(event) => setPoint({ ...point, lat: Number(event.target.value) })} required />
-                </div>
-                <div className="grid gap-2">
-                  <Label htmlFor="lng">Longitude</Label>
-                  <Input id="lng" value={point.lng} onChange={(event) => setPoint({ ...point, lng: Number(event.target.value) })} required />
-                </div>
-                <div className="grid gap-2">
-                  <Label htmlFor="radius">Radius m</Label>
-                  <Input id="radius" type="number" min={5} max={250} step={1} value={radius} onChange={(event) => setRadius(event.target.value)} required />
-                </div>
-              </div>
-              <div className="grid gap-2">
-                <Label htmlFor="spawn-expires">Expires, optional</Label>
-                <Input id="spawn-expires" type="datetime-local" value={spawnExpiry} onChange={(event) => setSpawnExpiry(event.target.value)} />
-              </div>
-              <div className="grid gap-2">
-                <Label htmlFor="model">GLB model</Label>
-                <Input id="model" type="file" accept=".glb,model/gltf-binary" onChange={(event) => setFile(event.target.files?.[0] ?? null)} />
-              </div>
-              <Button type="submit">Place on campus</Button>
-            </form>
+            <Button onClick={startCreate}>Add protein</Button>
             <ul className="grid gap-2">
               {spawns.map((spawn) => (
                 <li key={spawn.id} className="flex items-center justify-between gap-3 rounded-lg border px-3 py-2">
@@ -220,21 +328,43 @@ export function AdminPage() {
                       {spawn.expiresAt ? ` · until ${formatWhen(spawn.expiresAt)}` : ''}
                     </p>
                   </button>
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    onClick={() => {
-                      void api(`/api/admin/spawns/${spawn.id}`, { method: 'DELETE' }).then(load);
-                    }}
-                  >
-                    Remove
-                  </Button>
+                  <div className="flex gap-2">
+                    <Button size="sm" variant="outline" onClick={() => startEdit(spawn)}>
+                      Edit
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={() => {
+                        if (editingId === spawn.id) resetForm();
+                        void api(`/api/admin/spawns/${spawn.id}`, { method: 'DELETE' }).then(load);
+                      }}
+                    >
+                      Remove
+                    </Button>
+                  </div>
                 </li>
               ))}
             </ul>
           </CardContent>
         </Card>
       </section>
+      {editingId || creating ? (
+        <div
+          className="fixed inset-0 z-50 grid place-items-center overflow-auto bg-black/50 p-4"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) resetForm();
+          }}
+          onKeyDown={(event) => {
+            if (event.key === 'Escape') resetForm();
+          }}
+        >
+          <div role="dialog" aria-modal="true" aria-label={editingId ? 'Edit protein' : 'Add protein'} className="w-full max-w-lg rounded-xl border bg-card p-5 shadow-xl">
+            <h2 className="font-display text-2xl">{editingId ? 'Edit protein' : 'Add protein'}</h2>
+            <div className="mt-4 grid gap-4">{spawnEditor}</div>
+          </div>
+        </div>
+      ) : null}
     </main>
   );
 }

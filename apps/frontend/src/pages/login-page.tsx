@@ -1,22 +1,43 @@
+import { API_URL } from '@/lib/config';
 import { useEffect, useState } from 'react';
 import { Navigate, useSearchParams } from 'react-router-dom';
 import { Button } from '@/components/ui/button';
 import { useSession } from '@/components/session';
+import { api, ApiError } from '@/lib/api';
 import { authClient } from '@/lib/auth-client';
 
+type DevAccount = { role: 'admin' | 'student'; email: string; name: string; isAdmin: boolean };
+
 export function LoginPage() {
-  const { state, me } = useSession();
+  const { state, me, refresh } = useSession();
   const [params] = useSearchParams();
   const [googleReady, setGoogleReady] = useState(true);
   const [pending, setPending] = useState(false);
+  const [devAccounts, setDevAccounts] = useState<DevAccount[]>([]);
+  const [devError, setDevError] = useState('');
   const failed = params.has('error');
 
   useEffect(() => {
-    fetch('/api/health')
+    fetch(`${API_URL}/api/health`)
       .then((response) => response.json())
-      .then((body: { google?: boolean }) => setGoogleReady(Boolean(body.google)))
+      .then((body: { google?: boolean; devAccounts?: DevAccount[] }) => {
+        setGoogleReady(Boolean(body.google));
+        setDevAccounts(body.devAccounts ?? []);
+      })
       .catch(() => setGoogleReady(false));
   }, []);
+
+  async function devSignIn(role: DevAccount['role']) {
+    setPending(true);
+    setDevError('');
+    try {
+      await api('/api/dev/login', { method: 'POST', body: JSON.stringify({ role }) });
+      await refresh();
+    } catch (caught) {
+      setDevError(caught instanceof ApiError ? caught.message : 'Could not sign in.');
+      setPending(false);
+    }
+  }
 
   if (state === 'ready' && me) {
     return <Navigate to={me.access.active || me.isAdmin ? '/' : '/redeem'} replace />;
@@ -58,13 +79,41 @@ export function LoginPage() {
               setPending(true);
               void authClient.signIn.social({
                 provider: 'google',
-                callbackURL: window.location.origin + '/',
-                errorCallbackURL: window.location.origin + '/login',
+                callbackURL: window.location.origin + import.meta.env.BASE_URL,
+                errorCallbackURL: window.location.origin + import.meta.env.BASE_URL + 'login',
               });
             }}
           >
             Continue with Google
           </Button>
+          {devAccounts.length ? (
+            <div className="mt-8 rounded-lg border border-dashed p-4">
+              <p className="text-xs font-semibold tracking-[0.14em] text-muted-foreground uppercase">
+                Local dev sign-in
+              </p>
+              <p className="mt-1 text-xs text-muted-foreground">Skips Google. Only shown while the dev bypass is on.</p>
+              <div className="mt-3 grid gap-2">
+                {devAccounts.map((account) => (
+                  <Button
+                    key={account.role}
+                    variant="outline"
+                    className="h-auto justify-between py-2 text-left"
+                    disabled={pending}
+                    onClick={() => void devSignIn(account.role)}
+                  >
+                    <span>
+                      <span className="block font-medium">{account.isAdmin ? 'Dev admin' : 'Dev student'}</span>
+                      <span className="block text-xs font-normal text-muted-foreground">{account.email}</span>
+                    </span>
+                    <span className="text-xs text-muted-foreground">
+                      {account.isAdmin ? 'Can open /admin' : 'Needs a class code'}
+                    </span>
+                  </Button>
+                ))}
+              </div>
+              {devError ? <p className="mt-2 text-sm text-destructive">{devError}</p> : null}
+            </div>
+          ) : null}
         </div>
       </section>
     </main>

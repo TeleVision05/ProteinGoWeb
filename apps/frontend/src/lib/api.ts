@@ -1,3 +1,5 @@
+import { API_URL } from './config';
+
 export class ApiError extends Error {
   constructor(
     message: string,
@@ -12,7 +14,7 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   if (init?.body && !(init.body instanceof FormData) && !headers.has('Content-Type')) {
     headers.set('Content-Type', 'application/json');
   }
-  const response = await fetch(path, { ...init, headers, credentials: 'include' });
+  const response = await fetch(API_URL + path, { ...init, headers, credentials: 'include' });
   if (!response.ok) {
     let message = response.statusText;
     try {
