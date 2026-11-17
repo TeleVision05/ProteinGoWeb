@@ -8,7 +8,8 @@
     "serve": "python serve.py",
     "serve:http": "python serve.py --http",
     "add-model": "node scripts/add-model.mjs",
-    "inspect": "gltf-transform inspect"
+    "inspect": "gltf-transform inspect",
+    "make-lod": "node scripts/make-lod.mjs"
   },
   "devDependencies": {
     "@gltf-transform/cli": "^4.5.1"

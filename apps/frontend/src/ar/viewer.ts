@@ -47,19 +47,42 @@ function panelRect(ctx: CanvasRenderingContext2D, x: number, y: number, w: numbe
   ctx.closePath();
 }
 
+/** One detail level of a protein: its scene graph and animation. */
+type Level = {
+  root: THREE.Object3D;
+  mixer: THREE.AnimationMixer | null;
+  actions: THREE.AnimationAction[];
+  duration: number;
+  counts: { vertices: number; triangles: number } | null;
+};
+
+/** Size and floor-centring offset shared by every detail level of one protein. */
+type Frame = { size: THREE.Vector3; offset: THREE.Vector3 };
+
 type Loaded = {
   id: string;
   name: string;
   url: string;
+  /** Group in the scene: holds the model, or a THREE.LOD of both levels once the full one has arrived. */
   template: THREE.Object3D;
   size: THREE.Vector3;
+  /** Primary mixer (full detail when loaded) and its actions, for the animation panel. */
   mixer: THREE.AnimationMixer | null;
+  /** Every level's mixer: all are advanced together so the animation matches whichever level shows. */
+  mixers: THREE.AnimationMixer[];
   actions: THREE.AnimationAction[];
   duration: number;
+  lod: THREE.LOD | null;
+  low: Level | null;
+  high: Level | null;
 };
 
 const UP = new THREE.Vector3(0, 1, 0);
 const MOBILE_VERTEX_BUDGET = 4_000_000;
+// The low-detail copy takes over once the camera is farther than this many model-sizes away
+// (hysteresis stops it flickering at the boundary). Distances are set from the displayed size in layout().
+const LOD_SWITCH_SIZES = 3.2;
+const LOD_HYSTERESIS = 0.15;
 const TARGET_FPS = 60;
 const TARGET_MS = 1000 / TARGET_FPS;
 const TARGET_SIZE = 1.1; // metres, longest side of the protein (before pinch resizing)
@@ -380,72 +403,188 @@ export class ArViewer {
   // Loading
   // ----------------------------------------------------------------------------------------
 
-  /** Key (model URL) of the loaded model, or of the one currently downloading. */
-  get loadedId() { return this.model?.id ?? this.loadingId; }
+  /** Key of the loaded model, or of the one currently downloading. */
+  get loadedId() { return this.loadingId ?? this.model?.id ?? null; }
 
-  async load(id: string, url: string, name: string) {
-    if (this.loadedId === id) return;
-    const token = ++this.loadToken;
-    this.unload();
-    this.loadingId = id;
-    this.setStatus('loading');
-    try {
-      // Phones run out of memory on very large meshes, so refuse those before downloading all of it.
-      const budget = matchMedia('(pointer: coarse)').matches ? MOBILE_VERTEX_BUDGET : Infinity;
-      let bytes: ArrayBuffer | null = await fetchBytes(
-        url,
-        (got, total) => this.events.progress(total ? got / total : -1, `Downloading ${name}…`),
-        (json) => {
-          const { vertices, triangles } = glbCounts(json);
-          this.modelCounts = { vertices, triangles };
-          if (vertices > budget) {
-            throw new Error(
-              `${name} has ${(vertices / 1e6).toFixed(1)}M vertices and ${(triangles / 1e6).toFixed(1)}M triangles, too heavy for a phone ` +
-                `(limit ${(budget / 1e6).toFixed(0)}M vertices). Pick a lighter version of it in /admin.`,
-            );
-          }
-        },
-      );
-      if (token !== this.loadToken) return;
-      this.events.progress(-1, 'Preparing model…');
-      const gltf = await this.loader.parseAsync(bytes, '');
-      bytes = null; // the download buffer is no longer needed
-      if (token !== this.loadToken) return;
+  /** Which detail level is on screen right now: 0 = full detail, 1 = the low-detail copy. */
+  get lodLevel(): 0 | 1 {
+    const m = this.model;
+    if (!m) return 0;
+    if (m.lod) return m.lod.getCurrentLevel() === 0 ? 0 : 1;
+    return m.high ? 0 : 1;
+  }
 
-      const template = gltf.scene;
-      template.updateMatrixWorld(true);
-      const box = new THREE.Box3().setFromObject(template);
-      const size = box.getSize(new THREE.Vector3());
+  /**
+   * Download and parse one GLB into a scene graph that is not in the scene yet.
+   * `report` shows download progress (the first level only; background loads stay quiet).
+   */
+  private async fetchLevel(url: string, name: string, report: boolean, token: number): Promise<Level | null> {
+    // Phones run out of memory on very large meshes, so refuse those before downloading all of it.
+    const budget = matchMedia('(pointer: coarse)').matches ? MOBILE_VERTEX_BUDGET : Infinity;
+    let counts: { vertices: number; triangles: number } | null = null;
+    let bytes: ArrayBuffer | null = await fetchBytes(
+      url,
+      (got, total) => { if (report) this.events.progress(total ? got / total : -1, `Downloading ${name}…`); },
+      (json) => {
+        const found = glbCounts(json);
+        counts = found;
+        if (found.vertices > budget) {
+          throw new Error(
+            `${name} has ${(found.vertices / 1e6).toFixed(1)}M vertices and ${(found.triangles / 1e6).toFixed(1)}M triangles, too heavy for a phone ` +
+              `(limit ${(budget / 1e6).toFixed(0)}M vertices). Pick a lighter version of it in /admin.`,
+          );
+        }
+      },
+    );
+    if (token !== this.loadToken) return null;
+    if (report) this.events.progress(-1, 'Preparing model…');
+    const gltf = await this.loader.parseAsync(bytes, '');
+    bytes = null; // the download buffer is no longer needed
+    if (token !== this.loadToken) return null;
+
+    const root = gltf.scene;
+    let mixer: THREE.AnimationMixer | null = null;
+    let actions: THREE.AnimationAction[] = [];
+    let duration = 0;
+    if (gltf.animations.length) {
+      mixer = new THREE.AnimationMixer(root);
+      actions = gltf.animations.map((clip) => mixer!.clipAction(clip));
+      for (const action of actions) action.play();
+      duration = Math.max(...gltf.animations.map((clip) => clip.duration));
+    }
+    return { root, mixer, actions, duration, counts };
+  }
+
+  /** Put a freshly parsed level in place: bottom-centre at the origin, shadows on, CPU geometry freed. */
+  private prepareLevel(level: Level, frame: Frame | null): Frame {
+    const root = level.root;
+    root.updateMatrixWorld(true);
+    let size: THREE.Vector3;
+    let offset: THREE.Vector3;
+    if (frame) {
+      ({ size, offset } = frame);
+    } else {
+      const box = new THREE.Box3().setFromObject(root);
+      size = box.getSize(new THREE.Vector3());
       const center = box.getCenter(new THREE.Vector3());
-      template.position.set(-center.x, -box.min.y, -center.z); // bottom-centre at origin
-      this.releaseCpuGeometry(template);
-      template.traverse((o) => {
-        if ((o as THREE.Mesh).isMesh) o.castShadow = true;
-      });
-      this.content.add(template);
-      let mixer: THREE.AnimationMixer | null = null;
-      let actions: THREE.AnimationAction[] = [];
-      let duration = 0;
-      if (gltf.animations.length) {
-        mixer = new THREE.AnimationMixer(template);
-        actions = gltf.animations.map((clip) => mixer!.clipAction(clip));
-        for (const action of actions) action.play();
-        duration = Math.max(...gltf.animations.map((clip) => clip.duration));
-      }
-      this.animPlaying = true;
-      this.animSpeed = 1;
-      this.model = { id, name, url, template, size, mixer, actions, duration };
-      this.layout();
+      offset = new THREE.Vector3(-center.x, -box.min.y, -center.z);
+    }
+    // Both detail levels share one frame (the first one loaded), so they line up exactly.
+    root.position.add(offset);
+    this.releaseCpuGeometry(root);
+    root.traverse((o) => {
+      if ((o as THREE.Mesh).isMesh) o.castShadow = true;
+    });
+    return { size, offset };
+  }
+
+  /**
+   * Load a model. With `lowUrl` the small low-detail copy is shown first (ready quickly) and the full model
+   * arrives in the background; the viewer then switches between them by distance. Called while AR or the 3D
+   * preview is already showing a model, it swaps the model in place without leaving AR.
+   */
+  async load(id: string, url: string, name: string, opts: { lowUrl?: string | null } = {}) {
+    if (this.loadingId === id) return;
+    if (this.model?.id === id) {
+      // Asked for what is already on screen: drop any swap still in flight.
+      if (this.loadingId) { this.loadToken++; this.loadingId = null; }
+      return;
+    }
+    const swap = (this.mode === 'ar' || this.mode === 'preview') && !!this.model;
+    const lowUrl = opts.lowUrl && opts.lowUrl !== url ? opts.lowUrl : null;
+    const token = ++this.loadToken;
+    if (!swap) {
+      this.unload();
+      this.setStatus('loading');
+    }
+    this.loadingId = id;
+    try {
+      // First level to show: the low copy when there is one, otherwise the model itself.
+      const first = await this.fetchLevel(lowUrl ?? url, name, true, token);
+      if (!first || token !== this.loadToken) return;
+      const frame = this.prepareLevel(first, null);
+      const holder = new THREE.Group();
+      holder.add(first.root);
+      const next: Loaded = {
+        id, name, url,
+        template: holder,
+        size: frame.size,
+        mixer: first.mixer,
+        mixers: first.mixer ? [first.mixer] : [],
+        actions: first.actions,
+        duration: first.duration,
+        lod: null,
+        low: lowUrl ? first : null,
+        high: lowUrl ? null : first,
+      };
+      this.modelCounts = first.counts;
+      this.installModel(next, swap);
       await this.renderer.compileAsync(this.scene, this.camera);
       if (token !== this.loadToken) return;
       this.events.progress(1, 'Ready');
       this.loadingId = null;
-      this.setStatus('ready');
+      if (!swap) this.setStatus('ready');
+      if (lowUrl) void this.upgradeToHigh(next, url, name, token, frame);
     } catch (e) {
       if (token !== this.loadToken) return;
       this.loadingId = null;
-      this.setStatus('idle');
+      // A failed live swap leaves the current model alone; a failed first load goes back to idle.
+      if (!swap) this.setStatus('idle');
       this.events.error(e instanceof Error ? e.message : 'Could not load that model.');
+    }
+  }
+
+  /** Make `next` the model on screen. A model already showing is replaced in the same step and freed. */
+  private installModel(next: Loaded, keepUserScale: boolean) {
+    const old = this.model;
+    if (old) {
+      this.closeFact();
+      this.content.remove(old.template);
+      this.freeModel(old);
+    }
+    if (!keepUserScale) this.userScale = 1;
+    this.animPlaying = true;
+    this.animSpeed = 1;
+    this.content.add(next.template);
+    this.model = next;
+    this.layout();
+    this.shadowDirty = true;
+  }
+
+  /** Background step: fetch the full-detail model and add it as the near level. Quietly keeps the low copy on failure. */
+  private async upgradeToHigh(model: Loaded, url: string, name: string, token: number, frame: Frame) {
+    try {
+      const high = await this.fetchLevel(url, name, false, token);
+      if (!high) return;
+      if (token !== this.loadToken || this.model !== model) {
+        this.disposeLevel(high);
+        return;
+      }
+      this.prepareLevel(high, frame);
+      const low = model.low!;
+      const lod = new THREE.LOD();
+      lod.addLevel(high.root, 0);
+      lod.addLevel(low.root, 1, LOD_HYSTERESIS);
+      model.template.remove(low.root);
+      model.template.add(lod);
+      model.lod = lod;
+      model.high = high;
+      // Keep the animation in step with the copy that has been playing so far.
+      if (high.mixer) {
+        high.mixer.setTime(low.actions[0]?.time ?? 0);
+        high.mixer.timeScale = this.animSpeed;
+        model.mixers.push(high.mixer);
+        model.mixer = high.mixer;
+        model.actions = high.actions;
+        model.duration = high.duration;
+      }
+      this.modelCounts = high.counts ?? this.modelCounts;
+      this.layout();
+      this.shadowDirty = true;
+      await this.renderer.compileAsync(this.scene, this.camera);
+    } catch (e) {
+      // Too heavy for this phone, or the download failed: the low-detail model stays on screen.
+      console.warn('Full-detail model not loaded:', e instanceof Error ? e.message : e);
     }
   }
 
@@ -467,10 +606,8 @@ export class ArViewer {
     });
   }
 
-  private unload() {
-    this.closeFact();
-    if (!this.model) return;
-    this.model.template.traverse((o) => {
+  private disposeLevel(level: Level) {
+    level.root.traverse((o) => {
       const mesh = o as THREE.Mesh;
       if (!mesh.isMesh) return;
       mesh.geometry.dispose();
@@ -479,9 +616,22 @@ export class ArViewer {
         mat.dispose();
       }
     });
-    this.model.mixer?.stopAllAction();
-    this.userScale = 1;
+    level.mixer?.stopAllAction();
+  }
+
+  /** Free everything a model holds on the GPU (both detail levels). */
+  private freeModel(model: Loaded) {
+    if (model.low) this.disposeLevel(model.low);
+    if (model.high) this.disposeLevel(model.high);
+    model.lod?.clear();
+  }
+
+  private unload() {
+    this.closeFact();
+    if (!this.model) return;
     this.content.remove(this.model.template);
+    this.freeModel(this.model);
+    this.userScale = 1;
     this.model = null;
     this.modelCounts = null;
     this.layout();
@@ -502,6 +652,8 @@ export class ArViewer {
     // Thought bubble floats just above the top of the protein.
     // Everything floating around the protein is sized from the protein's current size, so it scales with pinch zoom.
     const unit = Math.max(m.size.x, m.size.y, m.size.z) * s;
+    // Low-detail copy takes over beyond a few model-sizes away, so it follows the pinch zoom as well.
+    if (m.lod && m.lod.levels[1]) m.lod.levels[1].distance = unit * LOD_SWITCH_SIZES;
     const width = unit * 0.28;
     this.bubbleBase = m.size.y * s + unit * 0.035;
     this.bubbleBob = unit * 0.022;
@@ -891,7 +1043,10 @@ export class ArViewer {
 
     if (frame && this.session) this.updateXR(frame);
     else this.controls.update();
-    if (this.animPlaying) this.model?.mixer?.update(Math.min(dt / 1000, 0.1));
+    if (this.animPlaying && this.model) {
+      const step = Math.min(dt / 1000, 0.1);
+      for (const mixer of this.model.mixers) mixer.update(step);
+    }
     this.faceViewer();
     if (this.panel) this.updatePanel(t);
 
@@ -1014,7 +1169,7 @@ export class ArViewer {
   }
 
   restart() {
-    this.model?.mixer?.setTime(0);
+    for (const mixer of this.model?.mixers ?? []) mixer.setTime(0);
     this.animPlaying = true;
     this.shadowDirty = true;
     this.drawPanel();
@@ -1022,7 +1177,7 @@ export class ArViewer {
 
   setSpeed(speed: number) {
     this.animSpeed = speed;
-    if (this.model?.mixer) this.model.mixer.timeScale = speed;
+    for (const mixer of this.model?.mixers ?? []) mixer.timeScale = speed;
     this.drawPanel();
   }
 
@@ -1030,7 +1185,7 @@ export class ArViewer {
   seek(fraction: number) {
     const m = this.model;
     if (!m?.mixer) return;
-    m.mixer.setTime(Math.min(1, Math.max(0, fraction)) * m.duration);
+    for (const mixer of m.mixers) mixer.setTime(Math.min(1, Math.max(0, fraction)) * m.duration);
     this.shadowDirty = true;
     this.drawPanel();
   }
@@ -1236,6 +1391,7 @@ export class ArViewer {
       `frame ${avg.toFixed(1)} ms  p95 ${p95.toFixed(1)}  max ${max.toFixed(0)}`,
       `cpu ${this.cpuMs.toFixed(1)} ms  gpu ${gpu}`,
       `${info.triangles.toLocaleString()} tris · ${info.calls} draws`,
+      this.model ? `detail ${this.lodLevel === 0 ? 'full' : 'low'}${this.model.low && !this.model.high ? ' (full loading)' : ''}` : 'detail -',
     ];
     if (this.mode === 'ar') {
       lines.push(`tracking updates ${poseHz.toFixed(0)}/s`);

@@ -6,6 +6,7 @@ import {
   Param,
   Patch,
   Post,
+  Query,
   Req,
   Res,
   UseGuards,
@@ -15,11 +16,17 @@ import { AdminGuard, AuthGuard, AuthedRequest, PlayGuard } from './auth.guard';
 import {
   GameError,
   catchAnywhere,
+  captureHeatmap,
   catchSpawn,
   createCode,
   createSpawn,
   deleteSpawn,
   getAccess,
+  getChallenge,
+  getCollection,
+  getLeaderboard,
+  getProgress,
+  getSettings,
   isAdminEmail,
   listAdminSpawns,
   listCodes,
@@ -27,8 +34,12 @@ import {
   readSpawnModel,
   redeemCode,
   revokeCode,
+  scatterSpawns,
+  updateSettings,
   updateSpawn,
+  type ModelFiles,
   type ModelUpload,
+  type Style,
 } from './game';
 import { devAccountList, devBypassEnabled, devCookie, devUser, isDevRole } from './dev-auth';
 import { r2Configured } from './storage';
@@ -60,21 +71,34 @@ function requiredNumber(value: unknown, label: string) {
   return number;
 }
 
+const FILE_SLOTS = ['sphere', 'sphereLow', 'ribbon', 'ribbonLow'] as const;
+
 async function readForm(request: FastifyRequest) {
   const fields: Record<string, string> = {};
-  let file: ModelUpload | null = null;
+  const files: ModelFiles = {};
   const parts = request.parts() as AsyncIterable<FieldPart | FilePart>;
   for await (const part of parts) {
     if (part.type === 'file') {
       const data = await part.toBuffer();
       if (part.filename && data.length) {
-        file = { filename: part.filename, mimetype: part.mimetype, data };
+        const upload: ModelUpload = { filename: part.filename, mimetype: part.mimetype, data };
+        // `file` is the older single-model field: it is the sphere model.
+        const slot = part.fieldname === 'file' ? 'sphere' : (FILE_SLOTS as readonly string[]).includes(part.fieldname) ? part.fieldname : null;
+        if (slot) files[slot as keyof ModelFiles] = upload;
       }
     } else {
       fields[part.fieldname] = String(part.value);
     }
   }
-  return { fields, file };
+  return { fields, files };
+}
+
+function parseStyles(value: unknown): Style[] {
+  if (typeof value !== 'string') return [];
+  return value
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter((entry): entry is Style => entry === 'sphere' || entry === 'ribbon');
 }
 
 @Controller('api')
@@ -118,7 +142,38 @@ export class GameController {
       isAdmin: isAdminEmail(request.user.email),
       access,
       catchAnywhere: catchAnywhere(),
+      settings: await getSettings(),
     };
+  }
+
+  @Get('progress')
+  @UseGuards(AuthGuard, PlayGuard)
+  progress(@Req() request: AuthedRequest) {
+    return getProgress(request.user.id);
+  }
+
+  @Get('collection')
+  @UseGuards(AuthGuard, PlayGuard)
+  collection(@Req() request: AuthedRequest) {
+    return getCollection(request.user.id);
+  }
+
+  @Get('leaderboard')
+  @UseGuards(AuthGuard, PlayGuard)
+  leaderboard(@Req() request: AuthedRequest) {
+    return getLeaderboard(request.user.id);
+  }
+
+  @Get('admin/settings')
+  @UseGuards(AuthGuard, AdminGuard)
+  settings() {
+    return getSettings();
+  }
+
+  @Patch('admin/settings')
+  @UseGuards(AuthGuard, AdminGuard)
+  saveSettings(@Body() body: { leaderboardEnabled?: boolean; rarityEnabled?: boolean }) {
+    return updateSettings({ leaderboardEnabled: body?.leaderboardEnabled, rarityEnabled: body?.rarityEnabled });
   }
 
   @Post('codes/redeem')
@@ -158,7 +213,11 @@ export class GameController {
 
   @Post('spawns/:id/catch')
   @UseGuards(AuthGuard, PlayGuard)
-  catch(@Req() request: AuthedRequest, @Param('id') id: string, @Body() body: { latitude?: number; longitude?: number }) {
+  catch(
+    @Req() request: AuthedRequest,
+    @Param('id') id: string,
+    @Body() body: { latitude?: number; longitude?: number; accuracy?: number; answer?: number },
+  ) {
     // With CATCH_ANYWHERE the location is optional (the app may not send one).
     const anywhere = catchAnywhere();
     return catchSpawn({
@@ -166,13 +225,26 @@ export class GameController {
       spawnId: id,
       latitude: anywhere && body.latitude == null ? undefined : requiredNumber(body.latitude, 'Latitude'),
       longitude: anywhere && body.longitude == null ? undefined : requiredNumber(body.longitude, 'Longitude'),
+      accuracy: body.accuracy == null ? undefined : requiredNumber(body.accuracy, 'Accuracy'),
+      answer: body.answer == null ? undefined : requiredNumber(body.answer, 'Answer'),
     });
+  }
+
+  @Get('spawns/:id/challenge')
+  @UseGuards(AuthGuard, PlayGuard)
+  challenge(@Param('id') id: string) {
+    return getChallenge(id);
   }
 
   @Get('models/:id')
   @UseGuards(AuthGuard, PlayGuard)
-  async model(@Param('id') id: string, @Res() reply: FastifyReply) {
-    const file = await readSpawnModel(id);
+  async model(
+    @Param('id') id: string,
+    @Query('style') style: string | undefined,
+    @Query('lod') lod: string | undefined,
+    @Res() reply: FastifyReply,
+  ) {
+    const file = await readSpawnModel(id, style, lod);
     reply.header('content-type', 'model/gltf-binary');
     reply.header('content-disposition', `inline; filename="${file.filename.replace(/"/g, '')}"`);
     reply.header('cache-control', 'private, max-age=3600');
@@ -188,7 +260,7 @@ export class GameController {
   @Post('admin/spawns')
   @UseGuards(AuthGuard, AdminGuard)
   async addSpawn(@Req() request: AuthedRequest) {
-    const { fields, file } = await readForm(request);
+    const { fields, files } = await readForm(request);
     return createSpawn({
       name: fields.name ?? '',
       summary: fields.summary ?? '',
@@ -197,8 +269,41 @@ export class GameController {
       radiusMeters: requiredNumber(fields.radiusMeters, 'Radius'),
       expiresAt: optionalDate(fields.expiresAt),
       createdBy: request.user.id,
-      file,
+      rarity: fields.rarity,
+      quiz: fields.quiz,
+      files,
     });
+  }
+
+  @Post('admin/spawns/scatter')
+  @UseGuards(AuthGuard, AdminGuard)
+  scatter(
+    @Req() request: AuthedRequest,
+    @Body()
+    body: {
+      templateId?: string;
+      count?: number;
+      centerLatitude?: number;
+      centerLongitude?: number;
+      areaRadiusMeters?: number;
+      namePrefix?: string;
+    },
+  ) {
+    return scatterSpawns({
+      templateId: body.templateId ?? '',
+      count: requiredNumber(body.count, 'Count'),
+      centerLatitude: requiredNumber(body.centerLatitude, 'Latitude'),
+      centerLongitude: requiredNumber(body.centerLongitude, 'Longitude'),
+      areaRadiusMeters: requiredNumber(body.areaRadiusMeters, 'Area radius'),
+      namePrefix: body.namePrefix,
+      createdBy: request.user.id,
+    });
+  }
+
+  @Get('admin/heatmap')
+  @UseGuards(AuthGuard, AdminGuard)
+  heatmap() {
+    return captureHeatmap();
   }
 
   @Patch('admin/spawns/:id')
@@ -206,7 +311,7 @@ export class GameController {
   async editSpawn(@Param('id') id: string, @Req() request: FastifyRequest) {
     const type = request.headers['content-type'] ?? '';
     if (type.includes('multipart/form-data')) {
-      const { fields, file } = await readForm(request);
+      const { fields, files } = await readForm(request);
       return updateSpawn(id, {
         name: fields.name,
         summary: fields.summary,
@@ -214,7 +319,10 @@ export class GameController {
         longitude: fields.longitude ? requiredNumber(fields.longitude, 'Longitude') : undefined,
         radiusMeters: fields.radiusMeters ? requiredNumber(fields.radiusMeters, 'Radius') : undefined,
         expiresAt: fields.expiresAt !== undefined ? optionalDate(fields.expiresAt) : undefined,
-        file,
+        rarity: fields.rarity,
+        quiz: fields.quiz,
+        files,
+        removeStyles: parseStyles(fields.removeStyles),
       });
     }
     const body = (request.body ?? {}) as {
@@ -224,6 +332,9 @@ export class GameController {
       longitude?: number;
       radiusMeters?: number;
       expiresAt?: string | null;
+      rarity?: string;
+      quiz?: unknown;
+      removeStyles?: string;
     };
     return updateSpawn(id, {
       name: body.name,
@@ -232,6 +343,9 @@ export class GameController {
       longitude: body.longitude,
       radiusMeters: body.radiusMeters,
       expiresAt: body.expiresAt === undefined ? undefined : optionalDate(body.expiresAt),
+      rarity: body.rarity,
+      quiz: body.quiz,
+      removeStyles: parseStyles(body.removeStyles),
     });
   }
 
