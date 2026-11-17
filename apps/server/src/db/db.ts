@@ -4,7 +4,7 @@ import { Pool } from 'pg';
 import * as authSchema from './auth-schema';
 import * as gameSchema from './game-schema';
 
-const pool = new Pool({
+export const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
 });
 

@@ -1,29 +1,51 @@
-import { apiOrigin } from '@/lib/config';
 import { useAr } from '@/components/ar-provider';
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { CampusMap } from '@/components/campus-map';
 import { useSession } from '@/components/session';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
+import { XpBar } from '@/components/xp-bar';
 import { api, ApiError } from '@/lib/api';
 import { signOutEverywhere } from '@/lib/auth-client';
-import type { Spawn } from '@/lib/types';
-import { distanceMeters, formatDistance, formatWhen } from '@/lib/utils';
+import type { CatchResult, Progress, Spawn } from '@/lib/types';
+import {
+  bearingDegrees,
+  cn,
+  compassLabel,
+  distanceMeters,
+  formatDistance,
+  formatWhen,
+  RARITY_COLOR,
+  RARITY_LABEL,
+} from '@/lib/utils';
 
 type Here = { lat: number; lng: number; accuracy: number };
+type GeoState = 'unknown' | 'granted' | 'prompt' | 'denied' | 'unsupported';
+type QuizState = { spawn: Spawn; question: string; options: string[]; message: string; busy: boolean };
+
+const GPS_TOLERANCE = 25;
+const POOR_ACCURACY = 50;
 
 export function MapPage() {
-  const { me } = useSession();
+  const { me, refresh } = useSession();
   const [spawns, setSpawns] = useState<Spawn[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [here, setHere] = useState<Here | null>(null);
+  const [geoState, setGeoState] = useState<GeoState>('unknown');
   const [geoError, setGeoError] = useState('');
+  const [geoRetry, setGeoRetry] = useState(0);
   const [actionError, setActionError] = useState('');
   const [pending, setPending] = useState(false);
+  const [quiz, setQuiz] = useState<QuizState | null>(null);
+  const [reward, setReward] = useState<{ spawn: Spawn; result: CatchResult } | null>(null);
+  const [progress, setProgress] = useState<Progress | null>(null);
+  const [showNearby, setShowNearby] = useState(false);
   const mapboxToken = import.meta.env.VITE_MAPBOX_TOKEN;
   const ar = useAr();
   const arActive = ar.status === 'ar' || ar.status === 'preview';
+  const arSupported = (ar as unknown as { arSupported?: boolean }).arSupported;
+  const viewLabel = arSupported === false ? 'View in 3D' : 'View in AR';
 
   useEffect(() => {
     if (arActive) return;
@@ -44,32 +66,78 @@ export function MapPage() {
   }, [arActive]);
 
   useEffect(() => {
-    if (arActive) return;
+    api<Progress>('/api/progress').then(setProgress).catch(() => undefined);
+  }, []);
+
+  // Track the browser's location permission so a denial gets clear instructions rather than a vague error.
+  useEffect(() => {
     if (!navigator.geolocation) {
-      setGeoError('This browser cannot share your location.');
+      setGeoState('unsupported');
       return;
     }
+    let status: PermissionStatus | null = null;
+    const sync = () => status && setGeoState(status.state as GeoState);
+    navigator.permissions
+      ?.query({ name: 'geolocation' })
+      .then((result) => {
+        status = result;
+        sync();
+        result.addEventListener('change', sync);
+      })
+      .catch(() => undefined);
+    return () => status?.removeEventListener('change', sync);
+  }, []);
+
+  useEffect(() => {
+    if (arActive || !navigator.geolocation) return;
     const watch = navigator.geolocation.watchPosition(
       (position) => {
         setGeoError('');
+        setGeoState('granted');
         setHere({
           lat: position.coords.latitude,
           lng: position.coords.longitude,
           accuracy: position.coords.accuracy,
         });
       },
-      () => setGeoError('Location is off. Catching needs it.'),
+      (error) => {
+        if (error.code === error.PERMISSION_DENIED) setGeoState('denied');
+        setGeoError(
+          error.code === error.PERMISSION_DENIED
+            ? 'Location is blocked.'
+            : error.code === error.POSITION_UNAVAILABLE
+              ? 'Your device could not find its position.'
+              : 'Finding your location is taking a while.',
+        );
+      },
       { enableHighAccuracy: true, maximumAge: 2000, timeout: 12_000 },
     );
     return () => navigator.geolocation.clearWatch(watch);
-  }, [arActive]);
+  }, [arActive, geoRetry]);
 
   const selected = spawns.find((spawn) => spawn.id === selectedId) ?? null;
   const distance = useMemo(() => {
     if (!selected || !here) return null;
     return distanceMeters(here.lat, here.lng, selected.latitude, selected.longitude);
   }, [selected, here]);
-  const inRange = distance != null && selected != null && distance <= selected.radiusMeters + 25;
+  const reach = selected ? selected.radiusMeters + GPS_TOLERANCE : 0;
+  const inRange = distance != null && selected != null && distance <= reach;
+
+  const nearby = useMemo(() => {
+    if (!here) return [];
+    return spawns
+      .map((spawn) => {
+        const meters = distanceMeters(here.lat, here.lng, spawn.latitude, spawn.longitude);
+        return {
+          spawn,
+          meters,
+          bearing: bearingDegrees(here.lat, here.lng, spawn.latitude, spawn.longitude),
+          inRange: meters <= spawn.radiusMeters + GPS_TOLERANCE,
+        };
+      })
+      .sort((a, b) => a.meters - b.meters);
+  }, [spawns, here]);
+  const nearestWild = nearby.find((entry) => !entry.spawn.caught) ?? null;
 
   // Start downloading the model as soon as a protein is selected, so Catch / View Model can open AR instantly.
   const { prepare } = ar;
@@ -81,23 +149,48 @@ export function MapPage() {
   const modelLoading = selected != null && ar.preparedId === selected.id && ar.status === 'loading';
   const loadingLabel = ar.progress >= 0 ? `Loading model ${Math.round(ar.progress * 100)}%` : 'Loading model…';
 
-  // Catching opens the AR view. Browsers only start AR right after a tap, so it opens immediately and the
-  // catch result follows: if the server turns the catch down, AR closes again and the reason is shown.
+  const select = useCallback((id: string) => {
+    setSelectedId(id);
+    setActionError('');
+    setReward(null);
+    setShowNearby(false);
+  }, []);
+
+  function applyCaught(spawn: Spawn, result: CatchResult) {
+    setSpawns((current) => current.map((item) => (item.id === spawn.id ? { ...item, caught: true } : item)));
+    setProgress(result.progress);
+    if (!result.already) setReward({ spawn, result });
+  }
+
+  function catchBody(extra: { answer?: number } = {}) {
+    return JSON.stringify({
+      ...(here ? { latitude: here.lat, longitude: here.lng, accuracy: here.accuracy } : {}),
+      ...extra,
+    });
+  }
+
+  // Catching opens the AR view. Browsers only start AR right after a tap, so for spawns without a quiz it opens
+  // immediately and the catch result follows: if the server turns the catch down, AR closes and the reason is shown.
+  // Quiz spawns ask the question first, then the catch is sent with the answer.
   function catchSelected() {
     if (!selected || (!here && !me?.catchAnywhere)) return;
     const spawn = selected;
+    setActionError('');
+    setReward(null);
+    if (spawn.hasQuiz) {
+      setPending(true);
+      api<{ question: string; options: string[] }>(`/api/spawns/${spawn.id}/challenge`)
+        .then((challenge) => setQuiz({ spawn, question: challenge.question, options: challenge.options, message: '', busy: false }))
+        .catch((error: unknown) => setActionError(error instanceof ApiError ? error.message : 'Could not load the question.'))
+        .finally(() => setPending(false));
+      return;
+    }
     const opensAr = spawn.hasModel && modelReady;
     setPending(true);
-    setActionError('');
-    const request = api(`/api/spawns/${spawn.id}/catch`, {
-      method: 'POST',
-      body: JSON.stringify(here ? { latitude: here.lat, longitude: here.lng } : {}),
-    });
+    const request = api<CatchResult>(`/api/spawns/${spawn.id}/catch`, { method: 'POST', body: catchBody() });
     if (opensAr) ar.enter();
     request
-      .then(() => {
-        setSpawns((current) => current.map((item) => (item.id === spawn.id ? { ...item, caught: true } : item)));
-      })
+      .then((result) => applyCaught(spawn, result))
       .catch((error: unknown) => {
         if (opensAr) ar.exit();
         setActionError(error instanceof ApiError ? error.message : 'Catch failed.');
@@ -105,18 +198,88 @@ export function MapPage() {
       .finally(() => setPending(false));
   }
 
+  function answer(index: number) {
+    if (!quiz || quiz.busy) return;
+    const { spawn } = quiz;
+    setQuiz({ ...quiz, busy: true, message: '' });
+    api<CatchResult>(`/api/spawns/${spawn.id}/catch`, { method: 'POST', body: catchBody({ answer: index }) })
+      .then((result) => {
+        setQuiz(null);
+        applyCaught(spawn, result);
+        if (spawn.hasModel && ar.preparedId === spawn.id && ar.status !== 'loading' && ar.status !== 'idle') ar.enter();
+      })
+      .catch((error: unknown) => {
+        const message = error instanceof ApiError ? error.message : 'Catch failed.';
+        if (error instanceof ApiError && (error.status === 422 || error.status === 429)) {
+          setQuiz((current) => (current ? { ...current, busy: false, message } : current));
+        } else {
+          setQuiz(null);
+          setActionError(message);
+        }
+      });
+  }
+
+  function dismissReward() {
+    setReward(null);
+    void refresh().catch(() => undefined);
+  }
+
+  const locationHelp =
+    geoState === 'denied' ? (
+      <div className="rounded-lg border border-destructive/40 bg-destructive/5 p-3 text-sm">
+        <p className="font-medium text-destructive">Location is blocked.</p>
+        <p className="mt-1 text-muted-foreground">
+          Catching needs your location. Tap the lock or site-settings icon next to the address bar, allow Location, then
+          retry. On iPhone: Settings → Privacy → Location Services → your browser → While Using.
+        </p>
+        <Button size="sm" className="mt-2" onClick={() => setGeoRetry((count) => count + 1)}>
+          Retry
+        </Button>
+      </div>
+    ) : geoState === 'unsupported' ? (
+      <p className="text-sm text-muted-foreground">This browser cannot share your location, so you cannot catch here.</p>
+    ) : !here ? (
+      <p className="text-xs text-muted-foreground">
+        {geoError ||
+          (geoState === 'prompt'
+            ? 'Allow location when your browser asks. It is only used to check you are near a protein.'
+            : 'Finding you…')}
+        {geoError ? (
+          <button className="ml-2 underline" onClick={() => setGeoRetry((count) => count + 1)}>
+            Retry
+          </button>
+        ) : null}
+      </p>
+    ) : here.accuracy > POOR_ACCURACY ? (
+      <p className="text-xs text-amber-700">
+        GPS is rough (±{Math.round(here.accuracy)} m). Step into the open for a better fix before catching.
+      </p>
+    ) : (
+      <p className="text-xs text-muted-foreground">GPS ±{Math.round(here.accuracy)} m</p>
+    );
+
   return (
     <div className="flex h-dvh flex-col bg-campus">
       <header className="flex h-14 shrink-0 items-center justify-between gap-3 px-4 text-primary-foreground">
-        <div>
+        <div className="min-w-0">
           <p className="font-display text-lg leading-none">ProteinGo</p>
-          <p className="text-xs text-primary-foreground/70">
-            {me?.access.active && me.access.expiresAt
-              ? `${me.access.label ?? 'Code'} until ${formatWhen(me.access.expiresAt)}`
-              : me?.user.email}
+          <p className="truncate text-xs text-primary-foreground/70">
+            {progress
+              ? `Level ${progress.level} · ${progress.xp} XP · ${progress.caught}/${progress.totalSpawns} caught`
+              : me?.access.active && me.access.expiresAt
+                ? `${me.access.label ?? 'Code'} until ${formatWhen(me.access.expiresAt)}`
+                : me?.user.email}
           </p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex shrink-0 items-center gap-1.5">
+          <Button asChild size="sm" variant="secondary">
+            <Link to="/collection">Collection</Link>
+          </Button>
+          {me?.settings?.leaderboardEnabled ? (
+            <Button asChild size="sm" variant="secondary">
+              <Link to="/leaderboard">Leaderboard</Link>
+            </Button>
+          ) : null}
           {me?.isAdmin ? (
             <Button asChild size="sm" variant="secondary">
               <Link to="/admin">Admin</Link>
@@ -142,18 +305,19 @@ export function MapPage() {
             spawns={spawns}
             selectedId={selectedId}
             followUser
-            onSelect={setSelectedId}
+            flyToSelected
+            onSelect={select}
           />
         ) : (
-          <div className="grid h-full content-start gap-2 overflow-auto p-4">
+          <div className="grid h-full content-start gap-2 overflow-auto p-4 pb-64 md:pb-4 md:pr-[22rem]">
             <p className="text-sm text-muted-foreground">
               Add VITE_MAPBOX_TOKEN to show the campus map. Spawns are listed here until then.
             </p>
             {spawns.map((spawn) => (
               <button
                 key={spawn.id}
-                className="rounded-lg border bg-card px-3 py-2 text-left"
-                onClick={() => setSelectedId(spawn.id)}
+                className={cn('rounded-lg border bg-card px-3 py-2 text-left', spawn.id === selectedId && 'border-primary')}
+                onClick={() => select(spawn.id)}
               >
                 <span className="font-medium">{spawn.name}</span>
                 <span className="mt-1 block text-xs text-muted-foreground">
@@ -165,18 +329,86 @@ export function MapPage() {
             ))}
           </div>
         )}
-        <aside className="absolute inset-x-3 bottom-3 rounded-xl border bg-card p-4 shadow-lg md:inset-x-auto md:top-4 md:right-4 md:bottom-auto md:w-80">
+
+        {nearestWild && !selected ? (
+          <button
+            className="absolute top-3 left-3 flex items-center gap-2 rounded-full border bg-card px-3 py-1.5 text-sm shadow-lg"
+            onClick={() => select(nearestWild.spawn.id)}
+          >
+            <span
+              className="inline-block text-lg leading-none"
+              style={{ transform: `rotate(${Math.round(nearestWild.bearing)}deg)` }}
+              aria-hidden
+            >
+              ↑
+            </span>
+            <span>
+              {nearestWild.inRange ? (
+                <b>{nearestWild.spawn.name} is in range</b>
+              ) : (
+                <>
+                  <b>{nearestWild.spawn.name}</b> {formatDistance(nearestWild.meters)} {compassLabel(nearestWild.bearing)}
+                </>
+              )}
+            </span>
+          </button>
+        ) : null}
+
+        <aside className="absolute inset-x-3 bottom-3 max-h-[70%] overflow-auto rounded-xl border bg-card p-4 shadow-lg md:inset-x-auto md:top-4 md:right-4 md:bottom-auto md:w-80">
           {!selected ? (
-            <div>
-              <p className="font-medium">Proteins on campus</p>
-              <p className="mt-1 text-sm text-muted-foreground">
-                {spawns.length === 0
-                  ? 'Nothing is placed right now.'
-                  : `${spawns.length} on the map. Gold is still out. Green is one you caught.`}
-              </p>
-              <p className="mt-3 text-xs text-muted-foreground">
-                {geoError || (here ? `GPS ±${Math.round(here.accuracy)} m` : 'Finding you…')}
-              </p>
+            <div className="grid gap-3">
+              <div>
+                <p className="font-medium">Proteins on campus</p>
+                <p className="mt-1 text-sm text-muted-foreground">
+                  {spawns.length === 0
+                    ? 'Nothing is placed right now.'
+                    : me?.settings?.rarityEnabled === false
+                      ? `${spawns.length} on the map. Faded ones are caught.`
+                      : `${spawns.length} on the map. Color shows rarity; faded ones are caught.`}
+                </p>
+              </div>
+              {progress ? <XpBar progress={progress} /> : null}
+              {locationHelp}
+              {spawns.length > 0 ? (
+                <div>
+                  <button
+                    className="text-sm font-medium underline"
+                    onClick={() => setShowNearby((open) => !open)}
+                  >
+                    {showNearby ? 'Hide nearby list' : 'Show nearby list'}
+                  </button>
+                  {showNearby ? (
+                    <ul className="mt-2 grid gap-1.5">
+                      {(here ? nearby : spawns.map((spawn) => ({ spawn, meters: null, bearing: 0, inRange: false }))).map(
+                        (entry) => (
+                          <li key={entry.spawn.id}>
+                            <button
+                              className="flex w-full items-center justify-between gap-2 rounded-lg border px-2.5 py-1.5 text-left text-sm"
+                              onClick={() => select(entry.spawn.id)}
+                            >
+                              <span className="min-w-0 truncate">
+                                {entry.spawn.name}
+                                {entry.spawn.caught ? <span className="text-emerald-700"> ✓</span> : null}
+                              </span>
+                              <span className="flex shrink-0 items-center gap-1.5 text-xs text-muted-foreground">
+                                {entry.inRange ? <Badge variant="good">In range</Badge> : null}
+                                {entry.meters != null ? (
+                                  <>
+                                    <span style={{ display: 'inline-block', transform: `rotate(${Math.round(entry.bearing)}deg)` }}>
+                                      ↑
+                                    </span>
+                                    {formatDistance(entry.meters)}
+                                  </>
+                                ) : null}
+                              </span>
+                            </button>
+                          </li>
+                        ),
+                      )}
+                    </ul>
+                  ) : null}
+                </div>
+              ) : null}
             </div>
           ) : (
             <div className="grid gap-3">
@@ -185,31 +417,96 @@ export function MapPage() {
                   <h2 className="font-display text-2xl leading-none">{selected.name}</h2>
                   {selected.summary ? <p className="mt-1 text-sm text-muted-foreground">{selected.summary}</p> : null}
                 </div>
-                <Badge variant={selected.caught ? 'good' : 'gold'}>{selected.caught ? 'Caught' : 'Wild'}</Badge>
+                <div className="flex shrink-0 flex-col items-end gap-1">
+                  <Badge variant={selected.caught ? 'good' : 'gold'}>{selected.caught ? 'Caught' : 'Wild'}</Badge>
+                  {me?.settings?.rarityEnabled === false ? null : (
+                    <Badge className={RARITY_COLOR[selected.rarity]}>{RARITY_LABEL[selected.rarity]}</Badge>
+                  )}
+                </div>
               </div>
               <p className="text-sm">
-                {distance == null ? 'Waiting for GPS.' : `${formatDistance(distance)} away · ${selected.radiusMeters} m radius`}
+                {distance == null
+                  ? 'Waiting for GPS.'
+                  : inRange
+                    ? `In range · ${formatDistance(distance)} away`
+                    : `${formatDistance(Math.max(0, distance - reach))} to go · ${formatDistance(distance)} away · catch within ${selected.radiusMeters} m`}
+              </p>
+              {here && here.accuracy > POOR_ACCURACY ? (
+                <p className="text-xs text-amber-700">GPS is rough (±{Math.round(here.accuracy)} m), so range may be off.</p>
+              ) : null}
+              {geoState === 'denied' ? locationHelp : null}
+              <p className="text-xs text-muted-foreground">
+                {selected.xp} XP{selected.hasQuiz && !selected.caught ? ' · answer a question to catch it' : ''}
+                {selected.styles.length > 1 ? ' · spheres and ribbon views' : ''}
               </p>
               {!selected.hasModel ? (
                 <p className="text-xs text-muted-foreground">No model attached. Add one in /admin.</p>
               ) : null}
               {ar.error ? <p className="text-sm text-destructive">{ar.error}</p> : null}
               {actionError ? <p className="text-sm text-destructive">{actionError}</p> : null}
+              {reward && reward.spawn.id === selected.id ? <RewardCard reward={reward} onClose={dismissReward} /> : null}
               <div className="flex gap-2">
                 {selected.caught ? (
                   <Button disabled={!selected.hasModel || !modelReady} onClick={() => ar.enter()}>
-                    {modelLoading ? loadingLabel : 'View Model'}
+                    {modelLoading ? loadingLabel : selected.hasModel ? viewLabel : 'No model yet'}
                   </Button>
                 ) : (
                   <Button disabled={pending || (!inRange && !me?.catchAnywhere) || modelLoading} onClick={catchSelected}>
-                    {modelLoading ? loadingLabel : 'Catch'}
+                    {modelLoading ? loadingLabel : pending ? 'Catching…' : 'Catch'}
                   </Button>
                 )}
+                <Button variant="ghost" onClick={() => setSelectedId(null)}>
+                  Close
+                </Button>
               </div>
             </div>
           )}
         </aside>
+
+        {quiz ? (
+          <div className="absolute inset-0 z-40 grid place-items-center bg-black/50 p-4">
+            <div role="dialog" aria-modal="true" className="w-full max-w-md rounded-xl border bg-card p-5 shadow-xl">
+              <p className="text-xs font-semibold tracking-[0.18em] text-muted-foreground uppercase">
+                Catch {quiz.spawn.name}
+              </p>
+              <h2 className="mt-1 font-display text-2xl leading-snug">{quiz.question}</h2>
+              <div className="mt-4 grid gap-2">
+                {quiz.options.map((option, index) => (
+                  <Button
+                    key={index}
+                    variant="outline"
+                    className="h-auto justify-start whitespace-normal px-4 py-3 text-left"
+                    disabled={quiz.busy}
+                    onClick={() => answer(index)}
+                  >
+                    {option}
+                  </Button>
+                ))}
+              </div>
+              {quiz.message ? <p className="mt-3 text-sm text-destructive">{quiz.message}</p> : null}
+              <Button className="mt-4" variant="ghost" onClick={() => setQuiz(null)}>
+                Cancel
+              </Button>
+            </div>
+          </div>
+        ) : null}
       </div>
+    </div>
+  );
+}
+
+function RewardCard({ reward, onClose }: { reward: { spawn: Spawn; result: CatchResult }; onClose: () => void }) {
+  const { result } = reward;
+  return (
+    <div className="rounded-lg border border-gold bg-gold/15 p-3 text-sm">
+      <p className="font-display text-xl">Caught {reward.spawn.name}!</p>
+      <p className="mt-1">
+        +{result.xp} XP{result.bonus > 0 ? ` (includes +${result.bonus} first-try bonus)` : ''}
+      </p>
+      {result.leveledUp ? <p className="mt-1 font-semibold text-emerald-800">Level up! You are now level {result.progress.level}.</p> : null}
+      <Button size="sm" variant="outline" className="mt-2" onClick={onClose}>
+        Nice
+      </Button>
     </div>
   );
 }

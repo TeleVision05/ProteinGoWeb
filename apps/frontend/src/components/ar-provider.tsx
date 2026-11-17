@@ -2,7 +2,7 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useRef, use
 import { createPortal } from 'react-dom';
 import { ArViewer, type ViewerStatus } from '@/ar/viewer';
 import { apiOrigin, DEBUG_TOOLS } from '@/lib/config';
-import type { Spawn } from '@/lib/types';
+import type { ModelStyle, Spawn, StyleName } from '@/lib/types';
 
 type ArApi = {
   status: ViewerStatus;
@@ -11,6 +11,16 @@ type ArApi = {
   /** 0..1, or -1 when unknown. */
   progress: number;
   error: string;
+  /** True when this device can run WebXR AR; otherwise the 3D viewer (orbit and zoom) is the fallback. */
+  arSupported: boolean;
+  /** Model styles the prepared protein comes in (e.g. sphere, ribbon). One entry means no toggle. */
+  styles: StyleName[];
+  /** Style on screen (or loading) now. */
+  style: StyleName | null;
+  /** True while a style swap is still downloading. */
+  swapping: boolean;
+  /** Switch the prepared protein to another style. Works live, inside AR or the 3D viewer. */
+  setStyle: (style: StyleName) => void;
   /** Start downloading a spawn's model so Inspect can open instantly. */
   prepare: (spawn: Spawn) => void;
   /** Call directly from a tap handler: AR can only start right after a user tap. */
@@ -25,6 +35,19 @@ export function useAr() {
   const value = useContext(ArContext);
   if (!value) throw new Error('useAr must be used inside ArProvider');
   return value;
+}
+
+const STYLE_LABEL: Record<StyleName, string> = { sphere: 'Spheres', ribbon: 'Ribbon' };
+
+/** The style to show for a spawn: the player's last pick if it still exists, else the spawn's default. */
+function pickEntry(spawn: Spawn, chosen: StyleName | undefined): ModelStyle | null {
+  const list = spawn.styles ?? [];
+  return (
+    list.find((entry) => entry.style === chosen) ??
+    list.find((entry) => entry.style === spawn.defaultStyle) ??
+    list[0] ??
+    null
+  );
 }
 
 const btn =
@@ -45,7 +68,15 @@ export function ArProvider({ children }: { children: ReactNode }) {
   const [clipOn, setClipOn] = useState(true);
   const [autoRes, setAutoRes] = useState(true);
   const [shadow, setShadow] = useState('map');
-  const arSupported = useRef(false);
+  const [arSupported, setArSupported] = useState(false);
+  const [styles, setStyles] = useState<StyleName[]>([]);
+  const [style, setStyleState] = useState<StyleName | null>(null);
+  const [swapping, setSwapping] = useState(false);
+  const arSupportedRef = useRef(false);
+  // The prepared spawn, and the style the player last picked for each protein (survives list refreshes).
+  const preparedRef = useRef<Spawn | null>(null);
+  const chosenRef = useRef(new Map<string, StyleName>());
+  const swapSeq = useRef(0);
 
   useEffect(() => {
     viewerRef.current?.setDevEnabled(devOn);
@@ -54,8 +85,8 @@ export function ArProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     navigator.xr
       ?.isSessionSupported('immersive-ar')
-      .then((ok) => { arSupported.current = ok; })
-      .catch(() => { arSupported.current = false; });
+      .then((ok) => { arSupportedRef.current = ok; setArSupported(ok); })
+      .catch(() => { arSupportedRef.current = false; setArSupported(false); });
   }, []);
 
   useEffect(() => () => {
@@ -79,32 +110,73 @@ export function ArProvider({ children }: { children: ReactNode }) {
 
   const prepare = useCallback(
     (spawn: Spawn) => {
-      if (!spawn.modelUrl) return;
+      const entry = pickEntry(spawn, chosenRef.current.get(spawn.id));
+      const url = entry?.url ?? spawn.modelUrl;
+      if (!url) return;
       const viewer = getViewer();
-      // Keyed by model URL (which carries a version), so an edited model reloads.
-      if (!viewer || viewer.loadedId === spawn.modelUrl) return;
+      // Keyed by style and model URL (which carries a version), so an edited model reloads.
+      const key = `${entry?.style ?? 'model'}|${url}`;
+      preparedRef.current = spawn;
+      setStyles((spawn.styles ?? []).map((item) => item.style));
+      setStyleState(entry?.style ?? null);
+      if (!viewer || viewer.loadedId === key) return;
       setError('');
       setProgress(-1);
       setPreparedId(spawn.id);
-      void viewer.load(spawn.modelUrl, new URL(spawn.modelUrl, apiOrigin).href, spawn.name);
+      setSwapping(false);
+      swapSeq.current++;
+      void viewer.load(key, new URL(url, apiOrigin).href, spawn.name, {
+        lowUrl: entry?.lowUrl ? new URL(entry.lowUrl, apiOrigin).href : null,
+      });
     },
     [getViewer],
   );
+
+  const setStyle = useCallback((next: StyleName) => {
+    const spawn = preparedRef.current;
+    const viewer = viewerRef.current;
+    const entry = spawn?.styles?.find((item) => item.style === next);
+    if (!spawn || !viewer || !entry) return;
+    const key = `${entry.style}|${entry.url}`;
+    if (viewer.loadedId === key) return;
+    const previous = chosenRef.current.get(spawn.id) ?? spawn.defaultStyle ?? null;
+    chosenRef.current.set(spawn.id, next);
+    setStyleState(next);
+    setError('');
+    setSwapping(true);
+    const seq = ++swapSeq.current;
+    void viewer
+      .load(key, new URL(entry.url, apiOrigin).href, spawn.name, {
+        lowUrl: entry.lowUrl ? new URL(entry.lowUrl, apiOrigin).href : null,
+      })
+      .then(() => {
+        if (seq !== swapSeq.current) return; // a newer pick took over
+        setSwapping(false);
+        // The swap failed (the viewer kept the old model): show the style that is really on screen.
+        if (viewer.loadedId !== key) {
+          if (previous) chosenRef.current.set(spawn.id, previous);
+          else chosenRef.current.delete(spawn.id);
+          setStyleState(previous);
+        }
+      });
+  }, []);
 
   const enter = useCallback(() => {
     const viewer = viewerRef.current;
     if (!viewer) return;
     setError('');
     setDevOn(false);
-    if (arSupported.current) viewer.enterAR();
+    if (arSupportedRef.current) viewer.enterAR();
     else viewer.enterPreview();
   }, []);
 
   const exit = useCallback(() => viewerRef.current?.exit(), []);
 
   const api = useMemo<ArApi>(
-    () => ({ status, preparedId, progress, error, prepare, enter, exit }),
-    [status, preparedId, progress, error, prepare, enter, exit],
+    () => ({
+      status, preparedId, progress, error, arSupported, styles, style, swapping, setStyle, prepare, enter, exit,
+    }),
+    [status, preparedId, progress, error, arSupported, styles, style, swapping, setStyle, prepare, enter, exit],
   );
 
   const active = status === 'ar' || status === 'preview';
@@ -134,9 +206,20 @@ export function ArProvider({ children }: { children: ReactNode }) {
               style={{ pointerEvents: status === 'ar' ? 'auto' : 'none' }}
             />
             <div className="absolute inset-x-3 top-[max(0.75rem,env(safe-area-inset-top))] flex items-start justify-between gap-2">
-              <button className={btn} onClick={() => viewerRef.current?.exit()}>
-                ← Map
-              </button>
+              <div className="flex items-center gap-2">
+                <button className={btn} onClick={() => viewerRef.current?.exit()}>
+                  ← Map
+                </button>
+                {styles.length > 1 && style ? (
+                  <button
+                    className={btn + ' disabled:opacity-60'}
+                    disabled={swapping}
+                    onClick={() => setStyle(styles.find((item) => item !== style) ?? style)}
+                  >
+                    {swapping ? 'Switching…' : STYLE_LABEL[styles.find((item) => item !== style) ?? style]}
+                  </button>
+                ) : null}
+              </div>
               {DEBUG_TOOLS ? (
                 <button className={btn} onClick={() => setDevOn((on) => !on)}>
                   Dev: {devOn ? 'on' : 'off'}

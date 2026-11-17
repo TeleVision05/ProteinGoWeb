@@ -2,6 +2,8 @@ import { BrowserRouter, Route, Routes } from 'react-router-dom';
 import { ArProvider } from '@/components/ar-provider';
 import { RequireAdmin, RequirePlay, RequireUser, SessionProvider } from '@/components/session';
 import { AdminPage } from '@/pages/admin-page';
+import { CollectionPage } from '@/pages/collection-page';
+import { LeaderboardPage } from '@/pages/leaderboard-page';
 import { LoginPage } from '@/pages/login-page';
 import { MapPage } from '@/pages/map-page';
 import { RedeemPage } from '@/pages/redeem-page';
@@ -27,6 +29,22 @@ export function App() {
               <RequireAdmin>
                 <AdminPage />
               </RequireAdmin>
+            }
+          />
+          <Route
+            path="/collection"
+            element={
+              <RequirePlay>
+                <CollectionPage />
+              </RequirePlay>
+            }
+          />
+          <Route
+            path="/leaderboard"
+            element={
+              <RequirePlay>
+                <LeaderboardPage />
+              </RequirePlay>
             }
           />
           <Route

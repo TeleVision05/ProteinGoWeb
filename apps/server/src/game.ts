@@ -1,6 +1,9 @@
-import { and, desc, eq, gt, isNull, or, sql } from 'drizzle-orm';
+import { and, desc, eq, gt, inArray, isNull, or, sql } from 'drizzle-orm';
 import { db } from './db/db';
-import { accessCode, capture, codeRedemption, spawn } from './db/game-schema';
+import { user } from './db/auth-schema';
+import { accessCode, appSetting, capture, codeRedemption, spawn, type ModelVariant } from './db/game-schema';
+import { buildAchievements, isRarity, levelFor, publicName, rewardFor, streaks, RARITIES, type ProgressStats, type Rarity } from './progress';
+import { rateLimited } from './rate-limit';
 import { deleteModel, putModel, readBundledModel, readModel } from './storage';
 
 export class GameError extends Error {
@@ -165,8 +168,28 @@ export type ModelUpload = {
   data: Buffer;
 };
 
+export type Style = ModelVariant['style'];
+export type Quiz = { question: string; options: string[]; answerIndex: number };
+/** Upload slots: the full model and an optional low-detail LOD, per style. */
+export type ModelFiles = Partial<Record<'sphere' | 'sphereLow' | 'ribbon' | 'ribbonLow', ModelUpload>>;
+
+const STYLES: Style[] = ['sphere', 'ribbon'];
+const GPS_MAX_ACCURACY_METERS = 150;
+/** Faster than this over more than MIN_JUMP_METERS between two catches is not walking. */
+const MAX_SPEED_MPS = 60;
+const MIN_JUMP_METERS = 500;
+const CATCH_LIMIT = { count: 20, windowMs: 60_000 };
+const WRONG_ANSWER_COOLDOWN_MS = 5_000;
+
 function assertCoordinates(latitude: number, longitude: number) {
-  if (latitude < -90 || latitude > 90 || longitude < -180 || longitude > 180) {
+  if (
+    !Number.isFinite(latitude) ||
+    !Number.isFinite(longitude) ||
+    latitude < -90 ||
+    latitude > 90 ||
+    longitude < -180 ||
+    longitude > 180
+  ) {
     throw new GameError('Those coordinates are not on the map.', 400);
   }
 }
@@ -185,17 +208,121 @@ function assertGlb(file: ModelUpload) {
   }
 }
 
-async function storeModel(spawnId: string, file: ModelUpload | null, previousKey: string | null) {
-  if (!file) return { modelKey: previousKey, modelFilename: null as string | null };
-  assertGlb(file);
-  // A new key per upload: the model URL carries it, so phones never reuse a cached older model.
-  const key = `proteins/${spawnId}-${Date.now()}.glb`;
-  await putModel(key, file.data, 'model/gltf-binary');
-  if (previousKey && previousKey !== key) await deleteModel(previousKey).catch(() => undefined);
-  return { modelKey: key, modelFilename: file.filename };
+export function parseRarity(value: unknown, fallback: Rarity = 'common'): Rarity {
+  if (value == null || value === '') return fallback;
+  if (!isRarity(value)) throw new GameError(`Rarity must be one of ${RARITIES.join(', ')}.`, 400);
+  return value;
 }
 
-function presentSpawn(row: typeof spawn.$inferSelect, caught: boolean) {
+/** Accepts a Quiz, its JSON text, or empty (no quiz). Throws on anything half-filled. */
+export function parseQuiz(value: unknown): Quiz | null {
+  if (value == null || value === '') return null;
+  let raw = value;
+  if (typeof raw === 'string') {
+    try {
+      raw = JSON.parse(raw);
+    } catch {
+      throw new GameError('The quiz is not valid.', 400);
+    }
+  }
+  if (raw == null) return null;
+  const quiz = raw as Partial<Quiz>;
+  const question = typeof quiz.question === 'string' ? quiz.question.trim() : '';
+  const options = Array.isArray(quiz.options) ? quiz.options.map((option) => String(option).trim()) : [];
+  if (question.length < 3 || question.length > 300) throw new GameError('The quiz question needs 3 to 300 characters.', 400);
+  if (options.length < 2 || options.length > 4 || options.some((o) => o.length < 1 || o.length > 120)) {
+    throw new GameError('A quiz needs 2 to 4 answers, each up to 120 characters.', 400);
+  }
+  if (new Set(options.map((option) => option.toLowerCase())).size !== options.length) {
+    throw new GameError('Quiz answers must all be different.', 400);
+  }
+  if (!Number.isInteger(quiz.answerIndex) || (quiz.answerIndex as number) < 0 || (quiz.answerIndex as number) >= options.length) {
+    throw new GameError('Mark which answer is correct.', 400);
+  }
+  return { question, options, answerIndex: quiz.answerIndex as number };
+}
+
+/** Spawns made before variants existed only have modelKey: that is their single sphere model. */
+export function variantsOf(row: typeof spawn.$inferSelect): ModelVariant[] {
+  if (row.variants?.length) return row.variants;
+  return row.modelKey ? [{ style: 'sphere', lod: 0, key: row.modelKey, filename: row.modelFilename }] : [];
+}
+
+function defaultStyleOf(variants: ModelVariant[]): Style | null {
+  const styles = STYLES.filter((style) => variants.some((v) => v.style === style && v.lod === 0));
+  return styles.includes('sphere') ? 'sphere' : (styles[0] ?? null);
+}
+
+function slotsOf(files: ModelFiles): { style: Style; lod: 0 | 1; file: ModelUpload }[] {
+  const slots: { style: Style; lod: 0 | 1; file: ModelUpload }[] = [];
+  const add = (style: Style, lod: 0 | 1, file?: ModelUpload) => {
+    if (file) slots.push({ style, lod, file });
+  };
+  add('sphere', 0, files.sphere);
+  add('sphere', 1, files.sphereLow);
+  add('ribbon', 0, files.ribbon);
+  add('ribbon', 1, files.ribbonLow);
+  return slots;
+}
+
+/**
+ * Applies new files and removals to a spawn's model variants and writes the files.
+ * Every upload gets a fresh key so phones never reuse a cached older model. A new full model drops its old
+ * low-detail LOD unless a new one came with it (a stale LOD would show the wrong shape from far away).
+ */
+async function storeVariants(
+  spawnId: string,
+  current: ModelVariant[],
+  files: ModelFiles,
+  removeStyles: Style[] = [],
+): Promise<ModelVariant[]> {
+  const slots = slotsOf(files);
+  for (const slot of slots) assertGlb(slot.file);
+  let next = current.filter((variant) => !removeStyles.includes(variant.style));
+  const dropped: string[] = current.filter((variant) => removeStyles.includes(variant.style)).map((v) => v.key);
+  const stamp = Date.now();
+  for (const { style, lod, file } of slots) {
+    const key = `proteins/${spawnId}-${style}-${lod}-${stamp}.glb`;
+    await putModel(key, file.data, 'model/gltf-binary');
+    const lowComesToo = Boolean(files[`${style}Low` as keyof ModelFiles]);
+    const replaced = next.filter((v) => v.style === style && (v.lod === lod || (lod === 0 && !lowComesToo)));
+    dropped.push(...replaced.map((v) => v.key));
+    next = next.filter((v) => !replaced.includes(v));
+    next.push({ style, lod, key, filename: file.filename });
+  }
+  // A low LOD only makes sense next to a full model.
+  const orphans = next.filter((v) => v.lod === 1 && !next.some((o) => o.style === v.style && o.lod === 0));
+  dropped.push(...orphans.map((v) => v.key));
+  next = next.filter((v) => !orphans.includes(v));
+  for (const key of new Set(dropped)) {
+    if (!next.some((v) => v.key === key)) await deleteModel(key).catch(() => undefined);
+  }
+  return next;
+}
+
+/** The columns the older single-model code reads: the default style's full model. */
+function mirrorColumns(variants: ModelVariant[]) {
+  const style = defaultStyleOf(variants);
+  const main = variants.find((v) => v.style === style && v.lod === 0);
+  return { modelKey: main?.key ?? null, modelFilename: main?.filename ?? null };
+}
+
+function modelUrl(id: string, variant: ModelVariant) {
+  return `/api/models/${id}?style=${variant.style}&lod=${variant.lod}&v=${encodeURIComponent(variant.key)}`;
+}
+
+/** With rarity levels switched off, everything counts as common. */
+function presentSpawn(row: typeof spawn.$inferSelect, caught: boolean, rarityOn = true) {
+  const variants = variantsOf(row);
+  const defaultStyle = defaultStyleOf(variants);
+  const styles = STYLES.flatMap((style) => {
+    const full = variants.find((v) => v.style === style && v.lod === 0);
+    if (!full) return [];
+    const low = variants.find((v) => v.style === style && v.lod === 1);
+    return [{ style, url: modelUrl(row.id, full), lowUrl: low ? modelUrl(row.id, low) : null, filename: full.filename }];
+  });
+  const main = styles.find((entry) => entry.style === defaultStyle);
+  const rarity = rarityOn && isRarity(row.rarity) ? row.rarity : 'common';
   return {
     id: row.id,
     name: row.name,
@@ -205,9 +332,14 @@ function presentSpawn(row: typeof spawn.$inferSelect, caught: boolean) {
     radiusMeters: row.radiusMeters,
     expiresAt: row.expiresAt?.toISOString() ?? null,
     createdAt: row.createdAt.toISOString(),
-    hasModel: Boolean(row.modelKey),
-    modelUrl: row.modelKey ? `/api/models/${row.id}?v=${encodeURIComponent(row.modelKey)}` : null,
-    modelFilename: row.modelFilename,
+    rarity,
+    xp: rewardFor(rarity, false).xp,
+    hasQuiz: Boolean(row.quiz),
+    hasModel: styles.length > 0,
+    modelUrl: main?.url ?? null,
+    modelFilename: main?.filename ?? null,
+    defaultStyle,
+    styles,
     caught,
   };
 }
@@ -218,22 +350,25 @@ function activeSpawnFilter(now: Date) {
 
 export async function listPlaySpawns(userId: string) {
   const now = new Date();
-  const rows = await db
-    .select()
-    .from(spawn)
-    .where(activeSpawnFilter(now))
-    .orderBy(spawn.name);
-  const caught = await db
-    .select({ spawnId: capture.spawnId })
-    .from(capture)
-    .where(eq(capture.userId, userId));
+  const rows = await db.select().from(spawn).where(activeSpawnFilter(now)).orderBy(spawn.name);
+  const caught = await db.select({ spawnId: capture.spawnId }).from(capture).where(eq(capture.userId, userId));
   const caughtIds = new Set(caught.map((row) => row.spawnId));
-  return rows.map((row) => presentSpawn(row, caughtIds.has(row.id)));
+  const { rarityEnabled } = await getSettings();
+  return rows.map((row) => presentSpawn(row, caughtIds.has(row.id), rarityEnabled));
 }
 
 export async function listAdminSpawns() {
   const rows = await db.select().from(spawn).orderBy(desc(spawn.createdAt));
-  return rows.map((row) => presentSpawn(row, false));
+  const counts = await db
+    .select({ spawnId: capture.spawnId, count: sql<number>`cast(count(*) as int)` })
+    .from(capture)
+    .groupBy(capture.spawnId);
+  const byId = new Map(counts.map((row) => [row.spawnId, Number(row.count)]));
+  return rows.map((row) => ({
+    ...presentSpawn(row, false),
+    quiz: row.quiz ?? null,
+    catchCount: byId.get(row.id) ?? 0,
+  }));
 }
 
 export async function createSpawn(input: {
@@ -244,7 +379,11 @@ export async function createSpawn(input: {
   radiusMeters: number;
   expiresAt: Date | null;
   createdBy: string;
-  file: ModelUpload | null;
+  rarity?: unknown;
+  quiz?: unknown;
+  files?: ModelFiles;
+  /** Older callers: a single model, stored as the sphere. */
+  file?: ModelUpload | null;
 }) {
   const name = input.name.trim();
   if (name.length < 2 || name.length > 80) throw new GameError('Name the protein.', 400);
@@ -253,8 +392,12 @@ export async function createSpawn(input: {
   if (input.expiresAt && input.expiresAt.getTime() <= Date.now()) {
     throw new GameError('The spawn expiry has to be in the future.', 400);
   }
+  const rarity = parseRarity(input.rarity);
+  const quiz = parseQuiz(input.quiz);
   const id = crypto.randomUUID();
-  const stored = await storeModel(id, input.file, null);
+  const files: ModelFiles = { ...input.files };
+  if (input.file && !files.sphere) files.sphere = input.file;
+  const variants = await storeVariants(id, [], files);
   const [row] = await db
     .insert(spawn)
     .values({
@@ -264,8 +407,10 @@ export async function createSpawn(input: {
       latitude: input.latitude,
       longitude: input.longitude,
       radiusMeters: input.radiusMeters,
-      modelKey: stored.modelKey,
-      modelFilename: stored.modelFilename,
+      rarity,
+      quiz,
+      variants,
+      ...mirrorColumns(variants),
       expiresAt: input.expiresAt,
       createdBy: input.createdBy,
       createdAt: new Date(),
@@ -283,7 +428,12 @@ export async function updateSpawn(
     longitude?: number;
     radiusMeters?: number;
     expiresAt?: Date | null;
+    rarity?: unknown;
+    /** undefined keeps the quiz; '' or null clears it. */
+    quiz?: unknown;
+    files?: ModelFiles;
     file?: ModelUpload | null;
+    removeStyles?: Style[];
   },
 ) {
   const [existing] = await db.select().from(spawn).where(eq(spawn.id, id));
@@ -295,7 +445,14 @@ export async function updateSpawn(
   const radiusMeters = input.radiusMeters ?? existing.radiusMeters;
   assertCoordinates(latitude, longitude);
   assertRadius(radiusMeters);
-  const stored = input.file ? await storeModel(id, input.file, existing.modelKey) : null;
+  const rarity = input.rarity === undefined ? parseRarity(existing.rarity) : parseRarity(input.rarity);
+  const quiz = input.quiz === undefined ? (existing.quiz ?? null) : parseQuiz(input.quiz);
+  const files: ModelFiles = { ...input.files };
+  if (input.file && !files.sphere) files.sphere = input.file;
+  const hasChange = slotsOf(files).length > 0 || (input.removeStyles?.length ?? 0) > 0;
+  const variants = hasChange
+    ? await storeVariants(id, variantsOf(existing), files, input.removeStyles ?? [])
+    : variantsOf(existing);
   const [row] = await db
     .update(spawn)
     .set({
@@ -304,9 +461,10 @@ export async function updateSpawn(
       latitude,
       longitude,
       radiusMeters,
+      rarity,
+      quiz,
       expiresAt: input.expiresAt !== undefined ? input.expiresAt : existing.expiresAt,
-      modelKey: stored?.modelKey ?? existing.modelKey,
-      modelFilename: stored?.modelFilename ?? existing.modelFilename,
+      ...(hasChange ? { variants, ...mirrorColumns(variants) } : {}),
     })
     .where(eq(spawn.id, id))
     .returning();
@@ -317,17 +475,288 @@ export async function deleteSpawn(id: string) {
   const [existing] = await db.select().from(spawn).where(eq(spawn.id, id));
   if (!existing) throw new GameError('Spawn not found.', 404);
   await db.delete(spawn).where(eq(spawn.id, id));
-  if (existing.modelKey) await deleteModel(existing.modelKey).catch(() => undefined);
+  for (const variant of variantsOf(existing)) await deleteModel(variant.key).catch(() => undefined);
 }
+
+/** Random points in a circle, spaced at least `spacing` meters apart where it can manage. */
+export function scatterPoints(
+  center: { latitude: number; longitude: number },
+  areaRadiusMeters: number,
+  count: number,
+  spacing: number,
+  random: () => number = Math.random,
+) {
+  const points: { latitude: number; longitude: number }[] = [];
+  const metersPerDegree = 111_320;
+  for (let i = 0; i < count; i++) {
+    let best: { latitude: number; longitude: number } | null = null;
+    for (let attempt = 0; attempt < 40; attempt++) {
+      const radius = areaRadiusMeters * Math.sqrt(random());
+      const angle = random() * Math.PI * 2;
+      const candidate = {
+        latitude: center.latitude + (radius * Math.cos(angle)) / metersPerDegree,
+        longitude:
+          center.longitude +
+          (radius * Math.sin(angle)) / (metersPerDegree * Math.cos((center.latitude * Math.PI) / 180)),
+      };
+      best = candidate;
+      if (points.every((p) => distanceMeters(p.latitude, p.longitude, candidate.latitude, candidate.longitude) >= spacing)) break;
+    }
+    if (best) points.push(best);
+  }
+  return points;
+}
+
+/** Makes `count` copies of a spawn at random spots in an area. Each copy gets its own copy of the model files. */
+export async function scatterSpawns(input: {
+  templateId: string;
+  count: number;
+  centerLatitude: number;
+  centerLongitude: number;
+  areaRadiusMeters: number;
+  namePrefix?: string;
+  createdBy: string;
+}) {
+  const [template] = await db.select().from(spawn).where(eq(spawn.id, input.templateId));
+  if (!template) throw new GameError('Pick a protein to copy.', 404);
+  if (!Number.isInteger(input.count) || input.count < 1 || input.count > 50) {
+    throw new GameError('Make between 1 and 50 copies at a time.', 400);
+  }
+  if (!Number.isFinite(input.areaRadiusMeters) || input.areaRadiusMeters < 20 || input.areaRadiusMeters > 2000) {
+    throw new GameError('The area radius has to be 20 to 2000 meters.', 400);
+  }
+  assertCoordinates(input.centerLatitude, input.centerLongitude);
+  const points = scatterPoints(
+    { latitude: input.centerLatitude, longitude: input.centerLongitude },
+    input.areaRadiusMeters,
+    input.count,
+    template.radiusMeters * 2,
+  );
+  const sources = variantsOf(template);
+  const buffers = new Map<string, Buffer>();
+  for (const variant of sources) {
+    const body = (await readModel(variant.key)) ?? (await readBundledModel(variant.filename));
+    if (body) buffers.set(variant.key, body);
+  }
+  const prefix = input.namePrefix?.trim();
+  const made: ReturnType<typeof presentSpawn>[] = [];
+  for (const [index, point] of points.entries()) {
+    const id = crypto.randomUUID();
+    const stamp = Date.now() + index;
+    const variants: ModelVariant[] = [];
+    for (const variant of sources) {
+      const body = buffers.get(variant.key);
+      if (!body) continue;
+      const key = `proteins/${id}-${variant.style}-${variant.lod}-${stamp}.glb`;
+      await putModel(key, body, 'model/gltf-binary');
+      variants.push({ ...variant, key });
+    }
+    const [row] = await db
+      .insert(spawn)
+      .values({
+        id,
+        name: prefix ? `${prefix} ${index + 1}` : template.name,
+        summary: template.summary,
+        latitude: point.latitude,
+        longitude: point.longitude,
+        radiusMeters: template.radiusMeters,
+        rarity: template.rarity,
+        quiz: template.quiz,
+        variants,
+        ...mirrorColumns(variants),
+        expiresAt: template.expiresAt,
+        createdBy: input.createdBy,
+        createdAt: new Date(),
+      })
+      .returning();
+    made.push(presentSpawn(row, false));
+  }
+  return made;
+}
+
+/** Where players have caught things: points for an admin heatmap. */
+export async function captureHeatmap() {
+  const rows = await db.select({ latitude: capture.latitude, longitude: capture.longitude }).from(capture);
+  return { points: rows.map((row) => ({ ...row, weight: 1 })) };
+}
+
+// ---- Settings ---------------------------------------------------------------------------------
+
+export async function getSettings() {
+  const rows = await db.select().from(appSetting);
+  const map = new Map(rows.map((row) => [row.key, row.value]));
+  return {
+    leaderboardEnabled: map.get('leaderboard_enabled') === 'true',
+    // On unless an admin turned it off.
+    rarityEnabled: map.get('rarity_enabled') !== 'false',
+  };
+}
+
+async function saveSwitch(key: string, label: string, value: unknown) {
+  if (value === undefined) return;
+  if (typeof value !== 'boolean') throw new GameError(`${label} must be true or false.`, 400);
+  await db
+    .insert(appSetting)
+    .values({ key, value: String(value) })
+    .onConflictDoUpdate({ target: appSetting.key, set: { value: String(value) } });
+}
+
+export async function updateSettings(input: { leaderboardEnabled?: boolean; rarityEnabled?: boolean }) {
+  await saveSwitch('leaderboard_enabled', 'leaderboardEnabled', input.leaderboardEnabled);
+  await saveSwitch('rarity_enabled', 'rarityEnabled', input.rarityEnabled);
+  return getSettings();
+}
+
+// ---- Progress, collection, leaderboard --------------------------------------------------------
+
+export async function getProgress(userId: string) {
+  const now = new Date();
+  const rows = await db
+    .select({
+      spawnId: capture.spawnId,
+      xp: capture.xp,
+      attempts: capture.attempts,
+      caughtAt: capture.caughtAt,
+      rarity: spawn.rarity,
+      hasQuiz: sql<boolean>`${spawn.quiz} is not null`,
+      expiresAt: spawn.expiresAt,
+    })
+    .from(capture)
+    .innerJoin(spawn, eq(capture.spawnId, spawn.id))
+    .where(eq(capture.userId, userId));
+  const [{ total }] = await db
+    .select({ total: sql<number>`cast(count(*) as int)` })
+    .from(spawn)
+    .where(activeSpawnFilter(now));
+  const byRarity: Record<Rarity, number> = { common: 0, uncommon: 0, rare: 0, legendary: 0 };
+  const { rarityEnabled } = await getSettings();
+  for (const row of rows) byRarity[rarityEnabled && isRarity(row.rarity) ? row.rarity : 'common']++;
+  const run = streaks(rows.map((row) => row.caughtAt), now);
+  const stats: ProgressStats = {
+    caught: rows.length,
+    activeCaught: rows.filter((row) => !row.expiresAt || row.expiresAt > now).length,
+    totalSpawns: Number(total),
+    streak: run.current,
+    bestStreak: run.best,
+    byRarity,
+    firstTryQuizzes: rows.filter((row) => row.hasQuiz && row.attempts === 1).length,
+  };
+  const xp = rows.reduce((sum, row) => sum + row.xp, 0);
+  const rank = rows.length ? await rankOf(xp) : null;
+  return {
+    xp,
+    ...levelFor(xp),
+    caught: stats.caught,
+    totalSpawns: stats.totalSpawns,
+    streak: stats.streak,
+    bestStreak: stats.bestStreak,
+    rank,
+    achievements: buildAchievements(stats),
+  };
+}
+
+async function rankOf(xp: number) {
+  const totals = await db
+    .select({ total: sql<number>`cast(sum(${capture.xp}) as int)` })
+    .from(capture)
+    .groupBy(capture.userId);
+  return 1 + totals.filter((row) => Number(row.total) > xp).length;
+}
+
+export async function getCollection(userId: string) {
+  const now = new Date();
+  const mine = await db.select().from(capture).where(eq(capture.userId, userId));
+  const caughtAt = new Map(mine.map((row) => [row.spawnId, row.caughtAt]));
+  const rows = await db
+    .select()
+    .from(spawn)
+    .where(
+      caughtAt.size ? or(activeSpawnFilter(now), inArray(spawn.id, [...caughtAt.keys()])) : activeSpawnFilter(now),
+    )
+    .orderBy(spawn.name);
+  const { rarityEnabled } = await getSettings();
+  const items = rows.map((row) => {
+    const view = presentSpawn(row, caughtAt.has(row.id), rarityEnabled);
+    return {
+      id: view.id,
+      name: view.name,
+      summary: view.summary,
+      rarity: view.rarity,
+      xp: view.xp,
+      caught: view.caught,
+      caughtAt: caughtAt.get(row.id)?.toISOString() ?? null,
+      hasModel: view.hasModel,
+      expired: Boolean(row.expiresAt && row.expiresAt <= now),
+      styles: view.styles,
+      defaultStyle: view.defaultStyle,
+    };
+  });
+  return { items, progress: await getProgress(userId) };
+}
+
+export async function getLeaderboard(userId: string) {
+  const settings = await getSettings();
+  if (!settings.leaderboardEnabled) return { enabled: false, entries: [], me: null };
+  const totals = await db
+    .select({
+      userId: capture.userId,
+      name: user.name,
+      xp: sql<number>`cast(sum(${capture.xp}) as int)`,
+      caught: sql<number>`cast(count(*) as int)`,
+    })
+    .from(capture)
+    .innerJoin(user, eq(capture.userId, user.id))
+    .groupBy(capture.userId, user.name)
+    .orderBy(desc(sql`sum(${capture.xp})`), sql`min(${capture.caughtAt})`);
+  const ranked = totals.map((row, index) => ({
+    rank: index + 1,
+    name: publicName(row.name),
+    xp: Number(row.xp),
+    level: levelFor(Number(row.xp)).level,
+    caught: Number(row.caught),
+    isMe: row.userId === userId,
+  }));
+  const me = ranked.find((row) => row.isMe);
+  return {
+    enabled: true,
+    entries: ranked.slice(0, 25),
+    me: me ? { rank: me.rank, xp: me.xp, level: me.level, caught: me.caught } : null,
+  };
+}
+
+// ---- Catching ---------------------------------------------------------------------------------
 
 /** TEMPORARY test switch: when CATCH_ANYWHERE=true, catching needs no location and no distance check. */
 export function catchAnywhere() {
   return process.env.CATCH_ANYWHERE === 'true';
 }
 
-export async function catchSpawn(input: { userId: string; spawnId: string; latitude?: number; longitude?: number }) {
+const wrongAnswers = new Map<string, { count: number; at: number }>();
+
+/** The question for a spawn, without the answer. */
+export async function getChallenge(spawnId: string) {
+  const [row] = await db
+    .select()
+    .from(spawn)
+    .where(and(eq(spawn.id, spawnId), activeSpawnFilter(new Date())));
+  if (!row) throw new GameError('This protein is no longer on campus.', 404);
+  if (!row.quiz) throw new GameError('This protein has no question.', 404);
+  return { question: row.quiz.question, options: row.quiz.options };
+}
+
+export async function catchSpawn(input: {
+  userId: string;
+  spawnId: string;
+  latitude?: number;
+  longitude?: number;
+  accuracy?: number;
+  answer?: number;
+}) {
   const anywhere = catchAnywhere();
   if (!anywhere) assertCoordinates(input.latitude as number, input.longitude as number);
+  if (rateLimited(`catch:${input.userId}`, CATCH_LIMIT.count, CATCH_LIMIT.windowMs)) {
+    throw new GameError('Too many catch attempts. Wait a minute and try again.', 429);
+  }
   const now = new Date();
   const [row] = await db
     .select()
@@ -338,31 +767,98 @@ export async function catchSpawn(input: { userId: string; spawnId: string; latit
     .select({ id: capture.id })
     .from(capture)
     .where(and(eq(capture.spawnId, row.id), eq(capture.userId, input.userId)));
-  if (already) return { caught: true, already: true };
+  if (already) {
+    return { caught: true, already: true, xp: 0, bonus: 0, leveledUp: false, progress: await getProgress(input.userId) };
+  }
   const latitude = input.latitude ?? row.latitude;
   const longitude = input.longitude ?? row.longitude;
-  const away = distanceMeters(latitude, longitude, row.latitude, row.longitude);
-  if (!anywhere && away > row.radiusMeters + GPS_TOLERANCE_METERS) {
-    throw new GameError(
-      `You are ${Math.round(away)} m away. Get within ${row.radiusMeters} m to catch it.`,
-      400,
-    );
+  if (!anywhere) {
+    if (input.accuracy != null && input.accuracy > GPS_MAX_ACCURACY_METERS) {
+      throw new GameError(
+        `Your GPS is too rough (±${Math.round(input.accuracy)} m). Move into the open and try again.`,
+        400,
+      );
+    }
+    const away = distanceMeters(latitude, longitude, row.latitude, row.longitude);
+    if (away > row.radiusMeters + GPS_TOLERANCE_METERS) {
+      throw new GameError(
+        `You are ${Math.round(away)} m away. Get within ${row.radiusMeters} m to catch it.`,
+        400,
+      );
+    }
+    // Anti-cheat: a spoofed location tends to teleport. Walking, biking and driving between campus spots are fine.
+    const [last] = await db
+      .select()
+      .from(capture)
+      .where(eq(capture.userId, input.userId))
+      .orderBy(desc(capture.caughtAt))
+      .limit(1);
+    if (last) {
+      const jump = distanceMeters(last.latitude, last.longitude, latitude, longitude);
+      const seconds = Math.max(1, (now.getTime() - last.caughtAt.getTime()) / 1000);
+      if (jump > MIN_JUMP_METERS && jump / seconds > MAX_SPEED_MPS) {
+        throw new GameError('Your location jumped too far, too fast. Try again in a moment.', 400);
+      }
+    }
   }
-  await db.insert(capture).values({
-    id: crypto.randomUUID(),
-    spawnId: row.id,
-    userId: input.userId,
-    latitude,
-    longitude,
-    caughtAt: now,
-  });
-  return { caught: true, already: false };
+
+  let attempts = 1;
+  if (row.quiz) {
+    if (!Number.isInteger(input.answer)) throw new GameError('Answer the question to catch this protein.', 400);
+    const key = `${input.userId}:${row.id}`;
+    const wrong = wrongAnswers.get(key);
+    if (wrong && now.getTime() - wrong.at < WRONG_ANSWER_COOLDOWN_MS) {
+      throw new GameError('Take a moment, then try again.', 429);
+    }
+    if (input.answer !== row.quiz.answerIndex) {
+      wrongAnswers.set(key, { count: (wrong?.count ?? 0) + 1, at: now.getTime() });
+      throw new GameError('Not quite. Give it another go.', 422);
+    }
+    attempts = (wrong?.count ?? 0) + 1;
+    wrongAnswers.delete(key);
+  }
+
+  const { rarityEnabled } = await getSettings();
+  const { xp: base, bonus } = rewardFor(rarityEnabled ? row.rarity : 'common', Boolean(row.quiz) && attempts === 1);
+  const before = await getProgress(input.userId);
+  const inserted = await db
+    .insert(capture)
+    .values({
+      id: crypto.randomUUID(),
+      spawnId: row.id,
+      userId: input.userId,
+      latitude,
+      longitude,
+      xp: base + bonus,
+      attempts,
+      caughtAt: now,
+    })
+    .onConflictDoNothing()
+    .returning({ id: capture.id });
+  if (!inserted.length) {
+    return { caught: true, already: true, xp: 0, bonus: 0, leveledUp: false, progress: before };
+  }
+  const progress = await getProgress(input.userId);
+  return {
+    caught: true,
+    already: false,
+    xp: base,
+    bonus,
+    leveledUp: progress.level > before.level,
+    progress,
+  };
 }
 
-export async function readSpawnModel(id: string) {
+export async function readSpawnModel(id: string, style?: string, lod?: string) {
   const [row] = await db.select().from(spawn).where(eq(spawn.id, id));
-  if (!row?.modelKey) throw new GameError('This protein has no model yet.', 404);
-  const body = (await readModel(row.modelKey)) ?? (await readBundledModel(row.modelFilename));
+  const variants = row ? variantsOf(row) : [];
+  const wantedStyle = style && (STYLES as string[]).includes(style) ? style : defaultStyleOf(variants);
+  const wantedLod = lod === '1' ? 1 : 0;
+  const variant =
+    variants.find((v) => v.style === wantedStyle && v.lod === wantedLod) ??
+    variants.find((v) => v.style === wantedStyle && v.lod === 0);
+  if (!variant) throw new GameError('This protein has no model yet.', 404);
+  const body = (await readModel(variant.key)) ?? (await readBundledModel(variant.filename));
   if (!body) throw new GameError('The model file is missing.', 404);
-  return { filename: row.modelFilename ?? 'protein.glb', body };
+  return { filename: variant.filename ?? 'protein.glb', body };
 }

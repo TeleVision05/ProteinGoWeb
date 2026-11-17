@@ -1,7 +1,9 @@
-// Usage: npm run add-model -- <file.glb> [display-name] [--meshopt-only]
+// Usage: npm run add-model -- <file.glb> [display-name] [--meshopt-only] [--style sphere|ribbon] [--group name] [--lod-ratio 0.15]
 //
-// Links (or copies) the source GLB into models/src/, writes meshopt (+ Draco) optimized variants,
-// and registers them in the model lists:
+// Links (or copies) the source GLB into models/src/, writes meshopt (+ Draco) optimized variants plus a
+// low-detail (LOD 1) copy of each (the viewer shows it first and when the model is far away),
+// and registers them in the model lists. Each entry carries group / style / lod / codec, so a sphere model and a
+// ribbon model with the same group are offered as a pair (the player can switch between them):
 //   models/models.json        committed + deployed (files under GitHub's 100 MB limit)
 //   models/models.local.json  local server only (originals and anything too big to push)
 import { execFileSync } from 'node:child_process';
@@ -10,7 +12,12 @@ import { basename, extname, join, resolve } from 'node:path';
 
 const args = process.argv.slice(2);
 const meshoptOnly = args.includes('--meshopt-only');
-const [input, nameArg] = args.filter((a) => !a.startsWith('--'));
+const flag = (name) => {
+  const i = args.indexOf(`--${name}`);
+  return i >= 0 ? args[i + 1] : undefined;
+};
+const flagValues = new Set(['style', 'group', 'lod-ratio'].map(flag).filter(Boolean));
+const [input, nameArg] = args.filter((a) => !a.startsWith('--') && !flagValues.has(a));
 if (!input) {
   console.error('Usage: npm run add-model -- <file.glb> [display-name] [--meshopt-only]');
   process.exit(1);
@@ -21,6 +28,10 @@ const root = resolve(import.meta.dirname, '..');
 const title = nameArg || basename(input, extname(input));
 const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
 const abs = (p) => join(root, p);
+// "actin-myosin-ribbon" -> group "actin-myosin", style "ribbon". Override with --group / --style.
+const style = flag('style') ?? (slug.endsWith('-ribbon') ? 'ribbon' : 'sphere');
+const group = flag('group') ?? slug.replace(/-(sphere|ribbon)$/, '');
+const lodRatio = flag('lod-ratio') ?? (style === 'ribbon' ? '0.2' : '0.15');
 for (const d of ['models/src', 'models/local']) mkdirSync(abs(d), { recursive: true });
 
 // Hard link instead of copying multi-GB sources when on the same volume.
@@ -28,12 +39,14 @@ const src = `models/src/${slug}.glb`;
 if (existsSync(abs(src))) unlinkSync(abs(src));
 try { linkSync(resolve(input), abs(src)); } catch { copyFileSync(resolve(input), abs(src)); }
 
-const cli = abs('node_modules/@gltf-transform/cli/bin/cli.js');
+// The CLI resolves from ./node_modules, or from the folder named by GLTF_TOOLS (see make-lod.mjs).
+const cli = resolve(process.env.GLTF_TOOLS ?? root, 'node_modules/@gltf-transform/cli/bin/cli.js');
 const variants = [{ suffix: 'meshopt', label: 'meshopt+quantized', args: ['--compress', 'meshopt'] }];
 if (!meshoptOnly) variants.push({ suffix: 'draco', label: 'Draco', args: ['--compress', 'draco'] });
 
 const mb = (p) => `${(statSync(abs(p)).size / 1048576).toFixed(1)} MB`;
 const deployed = [], local = [];
+const meta = (v, lod) => ({ group, style, lod, codec: v.suffix });
 for (const v of variants) {
   let out = `models/${slug}-${v.suffix}.glb`;
   for (const old of [out, `models/local/${slug}-${v.suffix}.glb`]) if (existsSync(abs(old))) unlinkSync(abs(old));
@@ -53,8 +66,14 @@ for (const v of variants) {
     out = moved;
     local.push({ name: `${title} · ${v.label} (${mb(out)})`, url: out });
   } else {
-    deployed.push({ name: `${title} · ${v.label} (${mb(out)})`, url: out });
+    deployed.push({ name: `${title} · ${v.label} (${mb(out)})`, url: out, ...meta(v, 0) });
   }
+  // Low-detail copy of the same file, same codec. Small, so it is always deployable.
+  const lodOut = `models/${slug}-lod1-${v.suffix}.glb`;
+  if (existsSync(abs(lodOut))) unlinkSync(abs(lodOut));
+  execFileSync(process.execPath, ['--max-old-space-size=8000', abs('scripts/make-lod.mjs'), abs(out), abs(lodOut),
+    '--codec', v.suffix, '--ratio', lodRatio], { cwd: root, stdio: 'inherit' });
+  deployed.push({ name: `${title} · low detail · ${v.label} (${mb(lodOut)})`, url: lodOut, ...meta(v, 1) });
 }
 local.push({ name: `${title} · original (${mb(src)})`, url: src });
 
@@ -62,7 +81,7 @@ const update = (file, entries) => {
   const p = abs(file);
   const list = existsSync(p) ? JSON.parse(readFileSync(p, 'utf8')) : [];
   // Drop any previous entries for this model (it may have moved between the deployed and local lists).
-  const mine = new Set([src, ...['meshopt', 'draco'].flatMap((s) => [`models/${slug}-${s}.glb`, `models/local/${slug}-${s}.glb`])]);
+  const mine = new Set([src, ...['meshopt', 'draco'].flatMap((s) => [`models/${slug}-${s}.glb`, `models/${slug}-lod1-${s}.glb`, `models/local/${slug}-${s}.glb`])]);
   const kept = list.filter((m) => !mine.has(m.url));
   writeFileSync(p, `${JSON.stringify([...kept, ...entries], null, 2)}\n`);
 };
