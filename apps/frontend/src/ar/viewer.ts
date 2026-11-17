@@ -6,6 +6,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { MeshoptDecoder } from 'three/addons/libs/meshopt_decoder.module.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import { disposeSprite, factFor, makeFactCard, makeQuizPanel, makeThoughtBubble, type QuizPhase } from './sprites';
+import { makePedestal, pedestalHeightFor, type ConsoleAction, type ConsoleState, type StyleChoice } from './pedestal';
 
 export type ViewerStatus = 'idle' | 'loading' | 'ready' | 'ar' | 'preview';
 
@@ -42,31 +43,6 @@ type QuizState = {
 // Best to worst. Only the protein casts a shadow; the floating UI never does.
 type ShadowTier = 'map' | 'blob' | 'off';
 const SHADOW_ORDER: ShadowTier[] = ['map', 'blob', 'off'];
-
-// In-world animation panel layout, in canvas pixels.
-const PANEL_W = 512;
-const PANEL_H = 372;
-const PANEL_PAD = 0;
-type PanelButton = { id: 'play' | 'restart' | 'speed'; speed: number; x: number; y: number; w: number; h: number };
-const PANEL_BUTTONS: PanelButton[] = [
-  { id: 'play', speed: 0, x: 28, y: 80, w: 220, h: 70 },
-  { id: 'restart', speed: 0, x: 264, y: 80, w: 220, h: 70 },
-  { id: 'speed', speed: 0.5, x: 28, y: 170, w: 144, h: 64 },
-  { id: 'speed', speed: 1, x: 184, y: 170, w: 144, h: 64 },
-  { id: 'speed', speed: 2, x: 340, y: 170, w: 144, h: 64 },
-];
-const TRACK = { x: 40, y: 268, w: 432, h: 16 };
-type WorldPanel = { mesh: THREE.Mesh; canvas: HTMLCanvasElement; texture: THREE.CanvasTexture; lastDraw: number };
-
-function panelRect(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, r: number) {
-  ctx.beginPath();
-  ctx.moveTo(x + r, y);
-  ctx.arcTo(x + w, y, x + w, y + h, r);
-  ctx.arcTo(x + w, y + h, x, y + h, r);
-  ctx.arcTo(x, y + h, x, y, r);
-  ctx.arcTo(x, y, x + w, y, r);
-  ctx.closePath();
-}
 
 /** One detail level of a protein: its scene graph and animation. */
 type Level = {
@@ -107,6 +83,9 @@ const LOD_HYSTERESIS = 0.15;
 const TARGET_FPS = 60;
 const TARGET_MS = 1000 / TARGET_FPS;
 const TARGET_SIZE = 1.1; // metres, longest side of the protein (before pinch resizing)
+const PEDESTAL_HEIGHT = 0.9; // metres: about waist height, so the screen is easy to reach and read
+const PEDESTAL_MAX = 1.4;
+const HEIGHT_KEY = 'proteingo.pedestalHeight';
 const MIN_USER_SCALE = 0.2;
 const MAX_USER_SCALE = 5;
 const JSM = `https://cdn.jsdelivr.net/npm/three@0.${THREE.REVISION}.0/examples/jsm/`;
@@ -251,6 +230,26 @@ export class ArViewer {
   private readonly bubble = makeThoughtBubble();
   private readonly hitBox = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), new THREE.MeshBasicMaterial({ visible: false }));
   private card: THREE.Mesh | null = null;
+  // The protein stands on a pedestal; everything that belongs on top of it (protein, bubble, cards) lives in `raised`.
+  private readonly raised = new THREE.Group();
+  private readonly pedestal = makePedestal();
+  private pedestalH = 0.3;
+  private pedestalMin = 0.5;
+  // The height the player chose (kept between visits); the pedestal never goes below what its screen needs.
+  private pedestalPref = ((): number => {
+    try {
+      const saved = Number(localStorage.getItem(HEIGHT_KEY));
+      if (saved >= 0.3 && saved <= PEDESTAL_MAX) return saved;
+    } catch { /* storage unavailable */ }
+    return PEDESTAL_HEIGHT;
+  })();
+  // The screen that slides out of the pedestal: which way it faces, and how far out it is.
+  private readonly consoleDir = new THREE.Vector3(0, 0, 1);
+  private consoleSnap = true;
+  private consoleWant = 0;
+  private consoleOpen = 0;
+  private consoleDrawn = 0;
+  private styleControl: { options: StyleChoice[]; active: StyleChoice; busy: boolean; pick: (style: StyleChoice) => void } | null = null;
   private quiz: QuizState | null = null;
 
   private readonly raycaster = new THREE.Raycaster();
@@ -289,7 +288,6 @@ export class ArViewer {
   private userScale = 1; // set by pinching
   private bubbleBase = 1;
   private bubbleBob = 0.02;
-  private panel: WorldPanel | null = null;
   private animPlaying = true;
   private animSpeed = 1;
   private pinchEndedAt = 0;
@@ -360,7 +358,8 @@ export class ArViewer {
     this.controls.enableDamping = true;
 
     this.anchorGroup.matrixAutoUpdate = false;
-    this.anchorGroup.add(this.content);
+    this.anchorGroup.add(this.pedestal.group, this.raised);
+    this.raised.add(this.content);
 
     this.reticle = new THREE.Mesh(
       new THREE.RingGeometry(0.07, 0.09, 40).rotateX(-Math.PI / 2),
@@ -397,7 +396,7 @@ export class ArViewer {
     this.blob.position.y = 0.002;
     this.blob.visible = false;
     this.bubble.visible = false;
-    this.anchorGroup.add(this.shadowCatcher, this.blob, this.bubble);
+    this.raised.add(this.shadowCatcher, this.blob, this.bubble);
     this.content.add(this.hitBox);
 
     this.floorOccluder.position.y = -0.003; // 3 mm margin so the base never flickers
@@ -559,14 +558,23 @@ export class ArViewer {
   /** Make `next` the model on screen. A model already showing is replaced in the same step and freed. */
   private installModel(next: Loaded, keepUserScale: boolean) {
     const old = this.model;
+    // Where the animation was, so a style swap carries on from the same moment (and stays paused if it was).
+    const oldTime = old?.actions[0] ? old.actions[0].time % (old.duration || 1) : 0;
     if (old) {
       this.closeFact();
       this.content.remove(old.template);
       this.freeModel(old);
     }
-    if (!keepUserScale) this.userScale = 1;
-    this.animPlaying = true;
-    this.animSpeed = 1;
+    if (!keepUserScale) {
+      this.userScale = 1;
+      this.animPlaying = true;
+      this.animSpeed = 1;
+    } else {
+      for (const mixer of next.mixers) {
+        mixer.timeScale = this.animSpeed;
+        mixer.setTime(next.duration ? oldTime % next.duration : 0);
+      }
+    }
     this.content.add(next.template);
     this.model = next;
     this.layout();
@@ -668,9 +676,21 @@ export class ArViewer {
     const m = this.model;
     this.bubble.visible = !!m && !this.card && !this.quiz;
     this.applyShadowTier();
+    this.pedestal.group.visible = !!m;
     if (!m) return;
     const s = this.scale();
     this.content.scale.setScalar(s);
+    // The protein stands on a pedestal, and the control screen slides out of it.
+    this.pedestal.setState(this.consoleState());
+    const bigSide = Math.max(m.size.x, m.size.y, m.size.z) * s;
+    const screenW = Math.max(bigSide * 0.5, 0.34);
+    const edge = Math.max(m.size.x, m.size.z) * s * 0.5;
+    const baseR = Math.max(edge * 0.95, bigSide * 0.28, screenW * 0.75);
+    this.pedestalMin = pedestalHeightFor(screenW / this.pedestal.aspect);
+    this.pedestalH = Math.min(PEDESTAL_MAX, Math.max(this.pedestalPref, this.pedestalMin));
+    this.pedestal.setState(this.consoleState()); // now showing the final height and range
+    this.pedestal.layout(baseR, this.pedestalH, screenW);
+    this.raised.position.y = this.pedestalH;
     // Thought bubble floats just above the top of the protein.
     // Everything floating around the protein is sized from the protein's current size, so it scales with pinch zoom.
     const unit = Math.max(m.size.x, m.size.y, m.size.z) * s;
@@ -689,15 +709,15 @@ export class ArViewer {
     cam.near = 0.01;
     cam.far = this.shadowRadius * 6;
     cam.updateProjectionMatrix();
-    const reach = this.shadowRadius * 2.4;
+    // Shadows fall on the pedestal's top, so they stop at its rim.
+    const reach = Math.min(this.shadowRadius * 2.4, baseR * 1.35);
     this.shadowCatcher.scale.set(reach, 1, reach);
-    const foot = Math.max(m.size.x, m.size.z) * s * 1.4;
+    const foot = Math.min(Math.max(m.size.x, m.size.z) * s * 1.4, baseR * 1.9);
     this.blob.scale.set(foot, 1, foot);
     this.hitBox.scale.copy(m.size);
     this.hitBox.position.set(0, m.size.y / 2, 0);
     if (this.card) this.placeCard();
     if (this.quiz) this.placeQuiz();
-    this.placePanel();
   }
 
   // ----------------------------------------------------------------------------------------
@@ -716,7 +736,6 @@ export class ArViewer {
   }
 
   private closeFact() {
-    this.closePanel();
     disposeSprite(this.card);
     this.card = null;
     this.bubble.visible = !!this.model && !this.quiz;
@@ -726,25 +745,24 @@ export class ArViewer {
     if (!this.model) return;
     const info = factFor(this.model.name, this.model.url);
     this.card = makeFactCard({ title: this.model.name || info.title, fact: info.fact });
-    this.anchorGroup.add(this.card);
+    this.raised.add(this.card);
     this.placeCard();
     this.bubble.visible = false;
-    if (this.model.mixer) this.openPanel();
   }
 
   // The raycaster must already be aimed. Tapping the protein opens the card; any tap closes it.
   private tapLearn() {
     if (!this.model) return;
     this.anchorGroup.updateMatrixWorld(true);
+    // The screen and the pedestal work at any time, even while a question is open.
+    if (this.tapConsole() || this.tapPedestal()) return;
     // While a question is open, taps only answer it: no fun-fact card or controls until it is answered.
     if (this.quiz) {
       this.tapQuiz();
       return;
     }
     if (this.card) {
-      const hit = this.panel ? this.raycaster.intersectObject(this.panel.mesh, false)[0] : undefined;
-      if (hit?.uv) this.panelTap(hit.uv.x, 1 - hit.uv.y);
-      else this.closeFact();
+      this.closeFact();
       return;
     }
     if (this.raycaster.intersectObjects([this.hitBox], false).length) this.openFact();
@@ -791,12 +809,16 @@ export class ArViewer {
     this.anchorGroup.matrix.identity();
     this.anchorGroup.visible = true;
     this.controls.enabled = true;
+    this.consoleSnap = true;
+    this.consoleWant = 1;
     this.setStatus('preview');
     this.renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
     this.resize();
     const size = TARGET_SIZE;
-    this.controls.target.set(0, size * 0.45, 0);
-    this.camera.position.set(size * 1.1, size * 0.9, size * 1.6);
+    // Far enough back to see the whole pedestal, with its screen, and the protein on top.
+    const mid = (this.pedestalH + size * 0.7) * 0.5;
+    this.controls.target.set(0, mid, 0);
+    this.camera.position.set(size * 1.5, mid + size * 0.6, size * 3.2);
     this.camera.near = 0.01;
     this.camera.far = 100;
     this.camera.updateProjectionMatrix();
@@ -886,6 +908,8 @@ export class ArViewer {
     this.grid.visible = true;
     this.placed = false;
     this.locked = false;
+    this.consoleWant = 0;
+    this.consoleOpen = 0;
     this.closeFact();
     this.clearChallenge();
     this.shrinkCanvas();
@@ -906,7 +930,7 @@ export class ArViewer {
       this.lastAnchorSig = sig;
       this.shadowDirty = true;
     }
-    this.anchorGroup.getWorldPosition(this.tmpV);
+    this.raised.getWorldPosition(this.tmpV);
     this.tmpV.y += (this.model.size.y * this.scale()) / 2;
     this.sun.target.position.copy(this.tmpV);
     this.sun.position.copy(this.tmpV).add(new THREE.Vector3(0.6, 1.6, 0.9).multiplyScalar(this.shadowRadius * 1.5));
@@ -984,6 +1008,8 @@ export class ArViewer {
     this.anchorGroup.visible = true;
     this.placed = true;
     this.locked = true;
+    this.consoleSnap = true;
+    this.consoleWant = 1;
     this.placedAt = performance.now();
     this.recentDts.length = 0;
     this.reticle.visible = false;
@@ -1077,7 +1103,7 @@ export class ArViewer {
       for (const mixer of this.model.mixers) mixer.update(step);
     }
     this.faceViewer();
-    if (this.panel) this.updatePanel(t);
+    this.updateConsole(t, dt);
     if (this.quiz) this.tickQuiz();
 
     // The thought bubble bobs gently so it reads as something to tap.
@@ -1195,20 +1221,20 @@ export class ArViewer {
   playPause() {
     this.animPlaying = !this.animPlaying;
     this.shadowDirty = true;
-    this.drawPanel();
+    this.syncConsole();
   }
 
   restart() {
     for (const mixer of this.model?.mixers ?? []) mixer.setTime(0);
     this.animPlaying = true;
     this.shadowDirty = true;
-    this.drawPanel();
+    this.syncConsole();
   }
 
   setSpeed(speed: number) {
     this.animSpeed = speed;
     for (const mixer of this.model?.mixers ?? []) mixer.timeScale = speed;
-    this.drawPanel();
+    this.syncConsole();
   }
 
   /** Jump to a point in the animation, as a 0..1 fraction. */
@@ -1217,45 +1243,7 @@ export class ArViewer {
     if (!m?.mixer) return;
     for (const mixer of m.mixers) mixer.setTime(Math.min(1, Math.max(0, fraction)) * m.duration);
     this.shadowDirty = true;
-    this.drawPanel();
-  }
-
-  private openPanel() {
-    const canvas = document.createElement('canvas');
-    canvas.width = PANEL_W + PANEL_PAD * 2;
-    canvas.height = PANEL_H + PANEL_PAD * 2;
-    const texture = new THREE.CanvasTexture(canvas);
-    texture.colorSpace = THREE.SRGBColorSpace;
-    texture.anisotropy = 4;
-    const mesh = new THREE.Mesh(
-      new THREE.PlaneGeometry(1, (PANEL_H + PANEL_PAD * 2) / (PANEL_W + PANEL_PAD * 2)),
-      new THREE.MeshBasicMaterial({ map: texture, transparent: true, depthTest: false, depthWrite: false, toneMapped: false }),
-    );
-    mesh.renderOrder = 21;
-    this.panel = { mesh, canvas, texture, lastDraw: 0 };
-    this.anchorGroup.add(mesh);
-    this.placePanel();
-    this.drawPanel();
-  }
-
-  private closePanel() {
-    if (!this.panel) return;
-    this.panel.mesh.removeFromParent();
-    this.panel.texture.dispose();
-    (this.panel.mesh.material as THREE.Material).dispose();
-    this.panel.mesh.geometry.dispose();
-    this.panel = null;
-  }
-
-  /** Beside the protein (to the viewer's right), about half way up. */
-  private placePanel() {
-    if (!this.panel || !this.model) return;
-    const s = this.scale();
-    const m = this.model;
-    const unit = Math.max(m.size.x, m.size.y, m.size.z) * s;
-    const width = unit * 0.3;
-    this.panel.mesh.scale.set(width, width, 1);
-    this.panel.mesh.position.set(Math.max(m.size.x, m.size.z) * s * 0.5 + width * 0.55 + unit * 0.035, m.size.y * s * 0.5, 0);
+    this.syncConsole();
   }
 
   /** The bubble and card are flat; turn them toward the viewer every frame. */
@@ -1264,86 +1252,6 @@ export class ArViewer {
     if (this.bubble.visible) this.bubble.lookAt(target);
     this.card?.lookAt(target);
     this.quiz?.panel.mesh.lookAt(target);
-    this.panel?.mesh.lookAt(target);
-  }
-
-  private updatePanel(t: number) {
-    if (!this.panel) return;
-    // Always face the viewer.
-    if (t - this.panel.lastDraw > 120) this.drawPanel(t);
-  }
-
-  private drawPanel(t = performance.now()) {
-    const panel = this.panel;
-    const m = this.model;
-    if (!panel || !m?.mixer || !m.actions.length) return;
-    panel.lastDraw = t;
-    const ctx = panel.canvas.getContext('2d')!;
-    ctx.clearRect(0, 0, panel.canvas.width, panel.canvas.height);
-    ctx.save();
-    ctx.translate(PANEL_PAD, PANEL_PAD);
-    ctx.lineWidth = 6;
-    ctx.fillStyle = 'rgba(10, 24, 40, 0.92)';
-    ctx.strokeStyle = '#4fd1a5';
-    panelRect(ctx, 6, 6, PANEL_W - 12, PANEL_H - 12, 40);
-    ctx.fill();
-    ctx.stroke();
-
-    ctx.fillStyle = '#4fd1a5';
-    ctx.font = '700 26px system-ui, sans-serif';
-    ctx.textAlign = 'left';
-    ctx.textBaseline = 'alphabetic';
-    ctx.fillText('ANIMATION', 36, 56);
-
-    const button = (b: PanelButton, label: string, active = false) => {
-      ctx.fillStyle = active ? '#4fd1a5' : 'rgba(255,255,255,0.16)';
-      panelRect(ctx, b.x, b.y, b.w, b.h, 18);
-      ctx.fill();
-      ctx.fillStyle = active ? '#06240f' : '#ffffff';
-      ctx.font = '700 32px system-ui, sans-serif';
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      ctx.fillText(label, b.x + b.w / 2, b.y + b.h / 2 + 2);
-    };
-    for (const b of PANEL_BUTTONS) {
-      if (b.id === 'play') button(b, this.animPlaying ? 'Pause' : 'Play');
-      else if (b.id === 'restart') button(b, 'Restart');
-      else button(b, `${b.speed}x`, this.animSpeed === b.speed);
-    }
-
-    // Scrubber: tap the bar to jump.
-    const time = m.actions[0].time % (m.duration || 1);
-    const frac = m.duration ? time / m.duration : 0;
-    ctx.fillStyle = 'rgba(255,255,255,0.22)';
-    panelRect(ctx, TRACK.x, TRACK.y, TRACK.w, TRACK.h, TRACK.h / 2);
-    ctx.fill();
-    ctx.fillStyle = '#4fd1a5';
-    panelRect(ctx, TRACK.x, TRACK.y, Math.max(TRACK.h, TRACK.w * frac), TRACK.h, TRACK.h / 2);
-    ctx.fill();
-    ctx.fillStyle = '#ffffff';
-    ctx.beginPath();
-    ctx.arc(TRACK.x + TRACK.w * frac, TRACK.y + TRACK.h / 2, 17, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.fillStyle = 'rgba(219,231,243,0.75)';
-    ctx.font = '400 26px ui-monospace, monospace';
-    ctx.textAlign = 'center';
-    ctx.fillText(`${time.toFixed(1)} / ${m.duration.toFixed(1)} s`, PANEL_W / 2, 346);
-    ctx.restore();
-    panel.texture.needsUpdate = true;
-  }
-
-  /** A tap on the panel, in panel-canvas coordinates as fractions (0..1, origin top-left). */
-  private panelTap(u: number, v: number) {
-    const x = u * (PANEL_W + PANEL_PAD * 2) - PANEL_PAD;
-    const y = v * (PANEL_H + PANEL_PAD * 2) - PANEL_PAD;
-    const hit = PANEL_BUTTONS.find((b) => x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h);
-    if (hit) {
-      if (hit.id === 'play') this.playPause();
-      else if (hit.id === 'restart') this.restart();
-      else this.setSpeed(hit.speed);
-      return;
-    }
-    if (y >= TRACK.y - 28 && y <= TRACK.y + TRACK.h + 28) this.seek((x - TRACK.x) / TRACK.w);
   }
 
   // ----------------------------------------------------------------------------------------
@@ -1360,7 +1268,7 @@ export class ArViewer {
     if (!challenge || !answer || challenge.options.length < 2) return;
     this.closeFact();
     const panel = makeQuizPanel(challenge.question, challenge.options.slice(0, 4));
-    this.anchorGroup.add(panel.mesh);
+    this.raised.add(panel.mesh);
     this.quiz = { panel, answer, phase: 'asking', picked: -1, message: '', lockedUntil: 0, secondsLeft: 0 };
     this.events.challenge?.(true);
     this.layout();
@@ -1381,9 +1289,130 @@ export class ArViewer {
     if (!q || !m) return;
     const s = this.scale();
     const unit = Math.max(m.size.x, m.size.y, m.size.z) * s;
-    const width = unit * 0.62;
+    const width = unit * 0.5;
     q.panel.mesh.scale.set(width, width / q.panel.mesh.userData.aspect, 1);
     q.panel.mesh.position.set(0, m.size.y * s + unit * 0.06, 0);
+  }
+
+  // ----------------------------------------------------------------------------------------
+  // Pedestal and its control screen
+  // ----------------------------------------------------------------------------------------
+
+  /** The app says which styles this protein comes in, which one is showing, and what to do when one is picked. */
+  setStyleToggle(options: StyleChoice[], active: StyleChoice | null, busy: boolean, pick: (style: StyleChoice) => void) {
+    const ordered = (['ribbon', 'sphere'] as StyleChoice[]).filter((style) => options.includes(style));
+    this.styleControl = ordered.length >= 2 && active ? { options: ordered, active, busy, pick } : null;
+    this.syncConsole();
+  }
+
+  /** What the screen shows right now: add a field here (and in pedestal.ts) to add a setting. */
+  private consoleState(): ConsoleState {
+    const m = this.model;
+    const animated = !!m?.mixer && m.actions.length > 0;
+    return {
+      title: m?.name ?? '',
+      styles: this.styleControl
+        ? { options: this.styleControl.options, active: this.styleControl.active, busy: this.styleControl.busy }
+        : null,
+      height: m ? { value: this.pedestalH, min: this.pedestalMin, max: PEDESTAL_MAX } : null,
+      animation:
+        animated && m
+          ? {
+              playing: this.animPlaying,
+              speed: this.animSpeed,
+              seconds: m.actions[0].time % (m.duration || 1),
+              duration: m.duration,
+            }
+          : null,
+    };
+  }
+
+  /** Repaint the screen; if its shape changed (a section came or went), fit the pedestal to it again. */
+  private syncConsole() {
+    if (this.pedestal.setState(this.consoleState())) this.layout();
+  }
+
+  private runConsole(action: ConsoleAction) {
+    switch (action.type) {
+      case 'style': {
+        const control = this.styleControl;
+        if (control && !control.busy && control.active !== action.style && control.options.includes(action.style)) {
+          control.pick(action.style);
+        }
+        break;
+      }
+      case 'play':
+        this.playPause();
+        break;
+      case 'restart':
+        this.restart();
+        break;
+      case 'speed':
+        this.setSpeed(action.speed);
+        break;
+      case 'seek':
+        this.seek(action.fraction);
+        break;
+      case 'height':
+        this.pedestalPref = action.value;
+        try {
+          localStorage.setItem(HEIGHT_KEY, String(action.value));
+        } catch { /* storage unavailable: it just will not be remembered */ }
+        this.layout();
+        this.shadowDirty = true;
+        break;
+    }
+  }
+
+  /** The raycaster must already be aimed. True when the tap was on the screen. */
+  private tapConsole() {
+    if (this.consoleOpen < 0.9) return false;
+    const hit = this.raycaster.intersectObject(this.pedestal.screen, false)[0];
+    if (!hit?.uv) return false;
+    const action = this.pedestal.hit(hit.uv.x, 1 - hit.uv.y);
+    if (action) this.runConsole(action);
+    return true;
+  }
+
+  /** Tapping the pedestal slides the screen away, or back out. */
+  private tapPedestal() {
+    if (!this.pedestal.hasContent) return false;
+    const onPedestal = this.raycaster.intersectObject(this.pedestal.body, false)[0];
+    if (!onPedestal) return false;
+    // The protein stands on the pedestal: a tap that lands on the protein is for the protein.
+    const onProtein = this.raycaster.intersectObject(this.hitBox, false)[0];
+    if (onProtein && onProtein.distance < onPedestal.distance) return false;
+    this.consoleWant = this.consoleWant ? 0 : 1;
+    return true;
+  }
+
+  /** Turns the screen toward the viewer, slides it in and out, and keeps its playhead moving. */
+  private updateConsole(t: number, dt: number) {
+    if (!this.model) return;
+    const target = this.mode === 'ar' ? this.viewerPos : this.camera.position;
+    const local = this.tmpV.copy(target);
+    this.anchorGroup.worldToLocal(local);
+    local.y = 0;
+    const away = local.length();
+    if (away > 0.05) {
+      local.divideScalar(away);
+      if (this.consoleSnap) {
+        this.consoleDir.copy(local);
+        this.consoleSnap = false;
+      } else {
+        this.consoleDir.lerp(local, 1 - Math.exp(-dt / 160));
+        if (this.consoleDir.lengthSq() < 1e-6) this.consoleDir.copy(local);
+        this.consoleDir.normalize();
+      }
+    }
+    const want = this.consoleWant && this.pedestal.hasContent ? 1 : 0;
+    this.consoleOpen += (want - this.consoleOpen) * (1 - Math.exp(-dt / 170));
+    if (Math.abs(want - this.consoleOpen) < 0.002) this.consoleOpen = want;
+    this.pedestal.aim(Math.atan2(this.consoleDir.x, this.consoleDir.z), this.consoleOpen);
+    if (this.consoleOpen > 0.5 && this.model.mixer && t - this.consoleDrawn > 120) {
+      this.consoleDrawn = t;
+      this.syncConsole();
+    }
   }
 
   private drawQuiz() {
@@ -1574,6 +1603,7 @@ export class ArViewer {
 
   dispose() {
     removeEventListener('resize', this.onResize);
+    this.pedestal.dispose();
     this.renderer.setAnimationLoop(null);
     this.unload();
     this.renderer.dispose();

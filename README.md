@@ -10,7 +10,9 @@ streaks and achievements, and fill a personal collection.
 - Map of nearby proteins, colored by rarity, with a "nearest protein" chip.
 - Catch flow in AR (WebXR): the quiz question and answers appear on an in-world panel, then the protein can be
   inspected. Devices without WebXR get the same experience in a 3D viewer.
-- Switch any protein between ribbon and sphere styles; models switch level of detail (LOD) by distance.
+- The protein stands on a pedestal. A screen slides out of the pedestal's front (tap the pedestal to hide or show it)
+  with the controls: a ribbon/spheres switch for proteins that have both, and animation play, restart, speed and scrub.
+  Models switch level of detail (LOD) by distance.
 - Collection page, XP bar, levels, daily streaks, 10 achievements, and an optional leaderboard.
 
 **Admins** (`/admin`)

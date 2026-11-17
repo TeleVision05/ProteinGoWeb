@@ -44,7 +44,6 @@ export function useAr() {
   return value;
 }
 
-const STYLE_LABEL: Record<StyleName, string> = { sphere: 'Spheres', ribbon: 'Ribbon' };
 
 /** The style to show for a spawn: the player's last pick if it still exists, else the spawn's default. */
 function pickEntry(spawn: Spawn, chosen: StyleName | undefined): ModelStyle | null {
@@ -79,7 +78,6 @@ export function ArProvider({ children }: { children: ReactNode }) {
   const [styles, setStyles] = useState<StyleName[]>([]);
   const [style, setStyleState] = useState<StyleName | null>(null);
   const [swapping, setSwapping] = useState(false);
-  const [asking, setAsking] = useState(false);
   const arSupportedRef = useRef(false);
   // The prepared spawn, and the style the player last picked for each protein (survives list refreshes).
   const preparedRef = useRef<Spawn | null>(null);
@@ -110,7 +108,6 @@ export function ArProvider({ children }: { children: ReactNode }) {
         hint: setHint,
         dev: setDevLines,
         error: setError,
-        challenge: setAsking,
       });
       if (pinchRef.current) viewerRef.current.bindPinch(pinchRef.current);
     }
@@ -183,6 +180,11 @@ export function ArProvider({ children }: { children: ReactNode }) {
 
   const exit = useCallback(() => viewerRef.current?.exit(), []);
 
+  // The Ribbon / Spheres switch lives in the scene; keep it in step with what is prepared and what is on screen.
+  useEffect(() => {
+    viewerRef.current?.setStyleToggle(styles, style, swapping, setStyle);
+  }, [styles, style, swapping, setStyle, preparedId]);
+
   const api = useMemo<ArApi>(
     () => ({
       status, preparedId, progress, error, arSupported, styles, style, swapping, setStyle, prepare, enter, exit,
@@ -221,15 +223,6 @@ export function ArProvider({ children }: { children: ReactNode }) {
                 <button className={btn} onClick={() => viewerRef.current?.exit()}>
                   ← Map
                 </button>
-                {styles.length > 1 && style && !asking ? (
-                  <button
-                    className={btn + ' disabled:opacity-60'}
-                    disabled={swapping}
-                    onClick={() => setStyle(styles.find((item) => item !== style) ?? style)}
-                  >
-                    {swapping ? 'Switching…' : STYLE_LABEL[styles.find((item) => item !== style) ?? style]}
-                  </button>
-                ) : null}
               </div>
               {DEBUG_TOOLS ? (
                 <button className={btn} onClick={() => setDevOn((on) => !on)}>
