@@ -24,7 +24,9 @@ One-time setup, about ten minutes (needs a free [Render](https://render.com) acc
 
 That is all: the database tables are created on start, and the app finds its own URL by itself.
 
-**After that, every push to `main` redeploys automatically.** Watch it under the service's *Events* tab.
+**Updating:** Render may be set to deploy only when you ask (*Auto-Deploy: Off* under the service's *Settings*).
+In that case, after merging to `main`, open the service and choose **Manual Deploy → Deploy latest commit**, or
+switch Auto-Deploy on so every push to `main` redeploys by itself. Watch builds under the service's *Events* tab.
 
 ### Using it
 
@@ -42,7 +44,7 @@ That is all: the database tables are created on start, and the app finds its own
 - Uploaded files live on a disk that is wiped on every deploy. Proteins made from **library models** keep
   working because those ship inside the app. A model you upload yourself is lost on the next deploy; to keep
   uploads, configure R2 (see Production).
-- Deploys are not instant: a build takes a few minutes, so a push is live a little later.
+- Deploys are not instant: a build takes a few minutes, so a change is live a little after it is deployed.
 
 ## Production
 

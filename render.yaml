@@ -1,5 +1,6 @@
 # TEST deployment on Render (free tier): one web service (API + frontend, built from the Dockerfile) and a
-# Postgres database. It redeploys on every push to the connected branch.
+# Postgres database. Redeploys happen on every push only if Auto-Deploy is on for the service; otherwise use
+# Manual Deploy in the dashboard.
 #
 # This is NOT a production setup. The dev sign-in bypass is ON, so anyone with the URL can open /admin.
 # That is why NODE_ENV is "staging": the bypass refuses to run when NODE_ENV is "production".
