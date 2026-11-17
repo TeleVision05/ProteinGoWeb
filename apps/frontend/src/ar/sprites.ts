@@ -160,3 +160,151 @@ export function makeFactCard({ title, fact }: { title: string; fact: string }) {
   ctx.fillText('Tap anywhere to close', pad, H - pad / 2 - 6);
   return billboardFrom(canvas);
 }
+
+export type QuizPhase = 'asking' | 'checking' | 'wrong' | 'correct';
+export type QuizView = {
+  phase: QuizPhase;
+  /** Option last tapped, or -1. */
+  picked: number;
+  /** Shown in the status row: the server's reason after a wrong answer, or the reward after a right one. */
+  message: string;
+  /** Seconds until options can be tapped again after a wrong answer. */
+  secondsLeft: number;
+};
+
+const LETTERS = ['A', 'B', 'C', 'D'];
+
+/**
+ * The in-world question panel: the question and 2 to 4 answer buttons on one flat card.
+ * `draw` repaints it for a state, `hit` turns a tap position (0..1, origin top-left) into an option index.
+ * The card's bottom-centre is its anchor, so it floats just above the position it is given.
+ */
+export function makeQuizPanel(question: string, options: string[]) {
+  const W = 1024;
+  const pad = 52;
+  const probe = document.createElement('canvas').getContext('2d')!;
+  probe.font = `700 54px ${FONT}`;
+  const questionLines = wrap(probe, question, W - pad * 2);
+  const questionLineH = 68;
+  const badge = 76;
+  const optionTextW = W - pad * 2 - badge - 64;
+  probe.font = `600 44px ${FONT}`;
+  const optionLines = options.map((option) => wrap(probe, option, optionTextW));
+  const optionH = optionLines.map((lines) => Math.max(116, 44 + lines.length * 56));
+  const gap = 20;
+  const headerH = 62;
+  const statusH = 92;
+  const top = pad;
+  const questionTop = top + headerH;
+  const optionsTop = questionTop + questionLines.length * questionLineH + 30;
+  const rects: { y: number; h: number }[] = [];
+  let y = optionsTop;
+  for (const h of optionH) {
+    rects.push({ y, h });
+    y += h + gap;
+  }
+  const statusTop = y - gap + 26;
+  const H = statusTop + statusH + pad * 0.5;
+
+  const canvas = document.createElement('canvas');
+  canvas.width = W;
+  canvas.height = H;
+  const ctx = canvas.getContext('2d')!;
+
+  function draw(view: QuizView) {
+    ctx.clearRect(0, 0, W, H);
+    roundRect(ctx, 8, 8, W - 16, H - 16, 48);
+    ctx.fillStyle = 'rgba(10, 24, 40, 0.95)';
+    ctx.fill();
+    ctx.lineWidth = 6;
+    ctx.strokeStyle = view.phase === 'correct' ? '#4fd1a5' : view.phase === 'wrong' ? '#e05252' : '#4fd1a5';
+    ctx.stroke();
+
+    ctx.textBaseline = 'alphabetic';
+    ctx.textAlign = 'left';
+    ctx.fillStyle = '#4fd1a5';
+    ctx.font = `700 28px ${FONT}`;
+    ctx.fillText('QUESTION', pad, top + 28);
+    ctx.fillStyle = '#ffffff';
+    ctx.font = `700 54px ${FONT}`;
+    questionLines.forEach((line, i) => ctx.fillText(line, pad, questionTop + 54 + i * questionLineH));
+
+    options.forEach((_, i) => {
+      const { y: oy, h } = rects[i];
+      const isPicked = view.picked === i;
+      const wrong = isPicked && view.phase === 'wrong';
+      const right = isPicked && view.phase === 'correct';
+      const busy = isPicked && view.phase === 'checking';
+      const dim = (view.phase === 'checking' || view.phase === 'correct') && !isPicked;
+      ctx.globalAlpha = dim ? 0.4 : view.phase === 'wrong' && !isPicked && view.secondsLeft > 0 ? 0.65 : 1;
+      ctx.fillStyle = right
+        ? '#4fd1a5'
+        : wrong
+          ? 'rgba(224, 82, 82, 0.55)'
+          : busy
+            ? 'rgba(79, 209, 165, 0.35)'
+            : 'rgba(255, 255, 255, 0.14)';
+      roundRect(ctx, pad, oy, W - pad * 2, h, 28);
+      ctx.fill();
+      // Letter badge.
+      ctx.fillStyle = right ? '#06240f' : 'rgba(255, 255, 255, 0.22)';
+      ctx.beginPath();
+      ctx.arc(pad + 24 + badge / 2, oy + h / 2, badge / 2 - 6, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = right ? '#4fd1a5' : '#ffffff';
+      ctx.font = `700 40px ${FONT}`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(LETTERS[i] ?? String(i + 1), pad + 24 + badge / 2, oy + h / 2 + 2);
+      // Answer text.
+      ctx.fillStyle = right ? '#06240f' : '#ffffff';
+      ctx.font = `600 44px ${FONT}`;
+      ctx.textAlign = 'left';
+      const lines = optionLines[i];
+      const textTop = oy + h / 2 - ((lines.length - 1) * 56) / 2;
+      lines.forEach((line, li) => ctx.fillText(line, pad + 24 + badge + 28, textTop + li * 56 + 2));
+      ctx.globalAlpha = 1;
+    });
+
+    // Status row.
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    const cy = statusTop + statusH / 2;
+    if (view.phase === 'checking') {
+      ctx.fillStyle = '#dbe7f3';
+      ctx.font = `600 40px ${FONT}`;
+      ctx.fillText('Checking…', W / 2, cy);
+    } else if (view.phase === 'wrong') {
+      ctx.fillStyle = '#ff8b8b';
+      ctx.font = `700 40px ${FONT}`;
+      ctx.fillText(view.message || 'Not quite.', W / 2, cy - (view.secondsLeft > 0 ? 24 : 0));
+      if (view.secondsLeft > 0) {
+        ctx.fillStyle = 'rgba(219, 231, 243, 0.8)';
+        ctx.font = `500 32px ${FONT}`;
+        ctx.fillText(`Try again in ${view.secondsLeft}s`, W / 2, cy + 28);
+      }
+    } else if (view.phase === 'correct') {
+      ctx.fillStyle = '#4fd1a5';
+      ctx.font = `700 44px ${FONT}`;
+      ctx.fillText(view.message || 'Correct!', W / 2, cy);
+    } else {
+      ctx.fillStyle = 'rgba(219, 231, 243, 0.7)';
+      ctx.font = `500 34px ${FONT}`;
+      ctx.fillText('Tap an answer to catch it', W / 2, cy);
+    }
+    texture.needsUpdate = true;
+  }
+
+  const mesh = billboardFrom(canvas, 0.5, 0);
+  const texture = (mesh.material as THREE.MeshBasicMaterial).map as THREE.CanvasTexture;
+  mesh.renderOrder = 22;
+
+  /** Which option a tap landed on (u, v in 0..1, origin top-left), or -1. */
+  function hit(_u: number, v: number) {
+    const py = v * H;
+    return rects.findIndex((rect) => py >= rect.y && py <= rect.y + rect.h);
+  }
+
+  draw({ phase: 'asking', picked: -1, message: '', secondsLeft: 0 });
+  return { mesh, draw, hit };
+}

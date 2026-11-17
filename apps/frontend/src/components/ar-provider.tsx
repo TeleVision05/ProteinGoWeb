@@ -1,8 +1,15 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
-import { ArViewer, type ViewerStatus } from '@/ar/viewer';
+import { ArViewer, type Challenge, type ChallengeOutcome, type ViewerStatus } from '@/ar/viewer';
 import { apiOrigin, DEBUG_TOOLS } from '@/lib/config';
 import type { ModelStyle, Spawn, StyleName } from '@/lib/types';
+
+/** A question to answer in the scene before the protein is caught. */
+export type EnterOptions = {
+  challenge?: Challenge | null;
+  /** Sends the chosen option to the server and says how it went. */
+  onAnswer?: (index: number) => Promise<ChallengeOutcome>;
+};
 
 type ArApi = {
   status: ViewerStatus;
@@ -23,8 +30,8 @@ type ArApi = {
   setStyle: (style: StyleName) => void;
   /** Start downloading a spawn's model so Inspect can open instantly. */
   prepare: (spawn: Spawn) => void;
-  /** Call directly from a tap handler: AR can only start right after a user tap. */
-  enter: () => void;
+  /** Call directly from a tap handler: AR can only start right after a user tap. Pass a challenge to ask a question first. */
+  enter: (options?: EnterOptions) => void;
   /** Leave AR (or the preview) and return to the map. */
   exit: () => void;
 };
@@ -72,6 +79,7 @@ export function ArProvider({ children }: { children: ReactNode }) {
   const [styles, setStyles] = useState<StyleName[]>([]);
   const [style, setStyleState] = useState<StyleName | null>(null);
   const [swapping, setSwapping] = useState(false);
+  const [asking, setAsking] = useState(false);
   const arSupportedRef = useRef(false);
   // The prepared spawn, and the style the player last picked for each protein (survives list refreshes).
   const preparedRef = useRef<Spawn | null>(null);
@@ -102,6 +110,7 @@ export function ArProvider({ children }: { children: ReactNode }) {
         hint: setHint,
         dev: setDevLines,
         error: setError,
+        challenge: setAsking,
       });
       if (pinchRef.current) viewerRef.current.bindPinch(pinchRef.current);
     }
@@ -161,11 +170,13 @@ export function ArProvider({ children }: { children: ReactNode }) {
       });
   }, []);
 
-  const enter = useCallback(() => {
+  const enter = useCallback((options?: EnterOptions) => {
     const viewer = viewerRef.current;
     if (!viewer) return;
     setError('');
     setDevOn(false);
+    // Always set (or clear) the question, so a previous protein's question never carries over.
+    viewer.setChallenge(options?.challenge ?? null, options?.onAnswer);
     if (arSupportedRef.current) viewer.enterAR();
     else viewer.enterPreview();
   }, []);
@@ -210,7 +221,7 @@ export function ArProvider({ children }: { children: ReactNode }) {
                 <button className={btn} onClick={() => viewerRef.current?.exit()}>
                   ← Map
                 </button>
-                {styles.length > 1 && style ? (
+                {styles.length > 1 && style && !asking ? (
                   <button
                     className={btn + ' disabled:opacity-60'}
                     disabled={swapping}

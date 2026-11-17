@@ -6,10 +6,11 @@ import { eq, inArray } from 'drizzle-orm';
 import { AdminGuard } from '../auth.guard';
 import { user } from '../db/auth-schema';
 import { db, pool } from '../db/db';
-import { capture, spawn } from '../db/game-schema';
+import { accessCode, capture, codeRedemption, spawn } from '../db/game-schema';
 import {
   GameError,
   catchSpawn,
+  createCode,
   createSpawn,
   getChallenge,
   getCollection,
@@ -18,6 +19,7 @@ import {
   getSettings,
   listAdminSpawns,
   listPlaySpawns,
+  redeemCode,
   scatterSpawns,
   updateSettings,
   updateSpawn,
@@ -80,6 +82,7 @@ before(async () => {
   const settings = await getSettings();
   originalLeaderboard = settings.leaderboardEnabled;
   originalRarity = settings.rarityEnabled;
+  await updateSettings({ rarityEnabled: true }); // the XP tests assume rarity levels are on
   await makeUser('a', 'Alex Rivera');
   await makeUser('b', 'Blair Chen');
   resetRateLimits();
@@ -255,6 +258,45 @@ describe('leaderboard setting', () => {
 
   it('rejects a setting that is not a boolean', async () => {
     await assert.rejects(updateSettings({ leaderboardEnabled: 'yes' as unknown as boolean }), GameError);
+  });
+});
+
+describe('access codes', () => {
+  it('says so, instead of failing, when a code already exists', async () => {
+    const code = `DUP-${run}`.toUpperCase();
+    const first = await createCode({
+      label: 'First',
+      expiresAt: new Date(Date.now() + 60_000),
+      code,
+      createdBy: userIds[0],
+    });
+    try {
+      await fails(
+        createCode({ label: 'Second', expiresAt: new Date(Date.now() + 60_000), code: code.toLowerCase(), createdBy: userIds[0] }),
+        409,
+        /already exists/,
+      );
+    } finally {
+      await db.delete(accessCode).where(eq(accessCode.id, first.id));
+    }
+  });
+
+  it('lets someone redeem the same code twice without an error', async () => {
+    const userId = await makeUser('redeemer');
+    const code = await createCode({
+      label: 'Twice',
+      expiresAt: new Date(Date.now() + 60_000),
+      createdBy: userIds[0],
+    });
+    try {
+      await redeemCode(userId, code.code);
+      assert.equal((await redeemCode(userId, code.code)).active, true);
+      const other = await makeUser('redeemer2');
+      assert.equal((await redeemCode(other, code.code)).active, true, 'a second person can use the same code');
+    } finally {
+      await db.delete(codeRedemption).where(eq(codeRedemption.codeId, code.id));
+      await db.delete(accessCode).where(eq(accessCode.id, code.id));
+    }
   });
 });
 

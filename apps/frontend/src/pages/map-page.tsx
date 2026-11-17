@@ -1,6 +1,7 @@
 import { useAr } from '@/components/ar-provider';
+import type { ChallengeOutcome } from '@/ar/viewer';
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { Link } from 'react-router-dom';
+import { HeaderNav, type NavItem } from '@/components/header-nav';
 import { CampusMap } from '@/components/campus-map';
 import { useSession } from '@/components/session';
 import { Badge } from '@/components/ui/badge';
@@ -41,6 +42,8 @@ export function MapPage() {
   const [reward, setReward] = useState<{ spawn: Spawn; result: CatchResult } | null>(null);
   const [progress, setProgress] = useState<Progress | null>(null);
   const [showNearby, setShowNearby] = useState(false);
+  // The selected protein's question, fetched ahead of time so the Catch tap can open AR straight away.
+  const [challenge, setChallenge] = useState<{ id: string; question: string; options: string[] } | null>(null);
   const mapboxToken = import.meta.env.VITE_MAPBOX_TOKEN;
   const ar = useAr();
   const arActive = ar.status === 'ar' || ar.status === 'preview';
@@ -145,9 +148,35 @@ export function MapPage() {
     if (selected?.hasModel) prepare(selected);
   }, [selected, prepare]);
 
+  const selectedQuizId = selected && selected.hasQuiz && !selected.caught ? selected.id : null;
+  useEffect(() => {
+    if (!selectedQuizId) {
+      setChallenge(null);
+      return;
+    }
+    let stop = false;
+    setChallenge((current) => (current?.id === selectedQuizId ? current : null));
+    api<{ question: string; options: string[] }>(`/api/spawns/${selectedQuizId}/challenge`)
+      .then((data) => {
+        if (!stop) setChallenge({ id: selectedQuizId, ...data });
+      })
+      // Could not load it: leave an empty one so Catch falls back to asking on the map (which shows the error).
+      .catch(() => {
+        if (!stop) setChallenge({ id: selectedQuizId, question: '', options: [] });
+      });
+    return () => {
+      stop = true;
+    };
+  }, [selectedQuizId]);
+
   const modelReady = selected != null && ar.preparedId === selected.id && ar.status !== 'loading' && ar.status !== 'idle';
   const modelLoading = selected != null && ar.preparedId === selected.id && ar.status === 'loading';
   const loadingLabel = ar.progress >= 0 ? `Loading model ${Math.round(ar.progress * 100)}%` : 'Loading model…';
+
+  // A quiz protein with a model asks its question in AR, so the question has to be here before the tap.
+  const waitingForQuestion = Boolean(
+    selected && selected.hasQuiz && !selected.caught && selected.hasModel && challenge?.id !== selected.id,
+  );
 
   const select = useCallback((id: string) => {
     setSelectedId(id);
@@ -177,7 +206,16 @@ export function MapPage() {
     const spawn = selected;
     setActionError('');
     setReward(null);
+    if (spawn.hasQuiz && spawn.hasModel && modelReady && challenge?.id === spawn.id && challenge.options.length >= 2) {
+      // The question is asked in AR itself, on a panel next to the protein. The catch is sent with the answer.
+      ar.enter({
+        challenge: { question: challenge.question, options: challenge.options },
+        onAnswer: (index) => answerInAr(spawn, index),
+      });
+      return;
+    }
     if (spawn.hasQuiz) {
+      // No model to show it on: ask on the map instead.
       setPending(true);
       api<{ question: string; options: string[] }>(`/api/spawns/${spawn.id}/challenge`)
         .then((challenge) => setQuiz({ spawn, question: challenge.question, options: challenge.options, message: '', busy: false }))
@@ -196,6 +234,26 @@ export function MapPage() {
         setActionError(error instanceof ApiError ? error.message : 'Catch failed.');
       })
       .finally(() => setPending(false));
+  }
+
+  /** An answer given in AR: sends the catch and tells the AR panel how it went. */
+  async function answerInAr(spawn: Spawn, index: number): Promise<ChallengeOutcome> {
+    try {
+      const result = await api<CatchResult>(`/api/spawns/${spawn.id}/catch`, {
+        method: 'POST',
+        body: catchBody({ answer: index }),
+      });
+      applyCaught(spawn, result);
+      if (result.already) return { ok: true, message: 'Already caught!' };
+      return { ok: true, message: `Caught! +${result.xp + result.bonus} XP${result.leveledUp ? ' · Level up!' : ''}` };
+    } catch (error) {
+      const message = error instanceof ApiError ? error.message : 'Catch failed.';
+      // A wrong answer or a cool-down: stay in AR and let them try again. Anything else ends the session.
+      if (error instanceof ApiError && (error.status === 422 || error.status === 429)) {
+        return { ok: false, message, retryAfterMs: 5000 };
+      }
+      return { ok: false, message, fatal: true };
+    }
   }
 
   function answer(index: number) {
@@ -223,6 +281,12 @@ export function MapPage() {
     setReward(null);
     void refresh().catch(() => undefined);
   }
+
+  const navItems: NavItem[] = [
+    { to: '/collection', label: 'Collection' },
+    ...(me?.settings?.leaderboardEnabled ? [{ to: '/leaderboard', label: 'Leaderboard' }] : []),
+    ...(me?.isAdmin ? [{ to: '/admin', label: 'Admin' }] : []),
+  ];
 
   const locationHelp =
     geoState === 'denied' ? (
@@ -260,7 +324,7 @@ export function MapPage() {
 
   return (
     <div className="flex h-dvh flex-col bg-campus">
-      <header className="flex h-14 shrink-0 items-center justify-between gap-3 px-4 text-primary-foreground">
+      <header className="relative z-40 flex h-14 shrink-0 items-center justify-between gap-3 px-4 text-primary-foreground">
         <div className="min-w-0">
           <p className="font-display text-lg leading-none">ProteinGo</p>
           <p className="truncate text-xs text-primary-foreground/70">
@@ -271,29 +335,7 @@ export function MapPage() {
                 : me?.user.email}
           </p>
         </div>
-        <div className="flex shrink-0 items-center gap-1.5">
-          <Button asChild size="sm" variant="secondary">
-            <Link to="/collection">Collection</Link>
-          </Button>
-          {me?.settings?.leaderboardEnabled ? (
-            <Button asChild size="sm" variant="secondary">
-              <Link to="/leaderboard">Leaderboard</Link>
-            </Button>
-          ) : null}
-          {me?.isAdmin ? (
-            <Button asChild size="sm" variant="secondary">
-              <Link to="/admin">Admin</Link>
-            </Button>
-          ) : null}
-          <Button
-            size="sm"
-            variant="ghost"
-            className="text-primary-foreground hover:bg-white/10"
-            onClick={() => void signOutEverywhere()}
-          >
-            Sign out
-          </Button>
-        </div>
+        <HeaderNav items={navItems} onSignOut={() => void signOutEverywhere()} />
       </header>
       <div className="relative min-h-0 flex-1 bg-background">
         {/* The map stays mounted (rebuilding it after AR froze phones); it is idle while AR runs. */}
@@ -332,7 +374,7 @@ export function MapPage() {
 
         {nearestWild && !selected ? (
           <button
-            className="absolute top-3 left-3 flex items-center gap-2 rounded-full border bg-card px-3 py-1.5 text-sm shadow-lg"
+            className="absolute top-3 left-3 z-30 flex items-center gap-2 rounded-full border bg-card px-3 py-1.5 text-sm shadow-lg"
             onClick={() => select(nearestWild.spawn.id)}
           >
             <span
@@ -354,7 +396,7 @@ export function MapPage() {
           </button>
         ) : null}
 
-        <aside className="absolute inset-x-3 bottom-3 max-h-[70%] overflow-auto rounded-xl border bg-card p-4 shadow-lg md:inset-x-auto md:top-4 md:right-4 md:bottom-auto md:w-80">
+        <aside className="absolute z-30 inset-x-3 bottom-3 max-h-[70%] overflow-auto rounded-xl border bg-card p-4 shadow-lg md:inset-x-auto md:top-4 md:right-4 md:bottom-auto md:w-80">
           {!selected ? (
             <div className="grid gap-3">
               <div>
@@ -436,7 +478,7 @@ export function MapPage() {
               ) : null}
               {geoState === 'denied' ? locationHelp : null}
               <p className="text-xs text-muted-foreground">
-                {selected.xp} XP{selected.hasQuiz && !selected.caught ? ' · answer a question to catch it' : ''}
+                {selected.xp} XP{selected.hasQuiz && !selected.caught ? (selected.hasModel ? ' · answer a question in AR to catch it' : ' · answer a question to catch it') : ''}
                 {selected.styles.length > 1 ? ' · spheres and ribbon views' : ''}
               </p>
               {!selected.hasModel ? (
@@ -451,8 +493,11 @@ export function MapPage() {
                     {modelLoading ? loadingLabel : selected.hasModel ? viewLabel : 'No model yet'}
                   </Button>
                 ) : (
-                  <Button disabled={pending || (!inRange && !me?.catchAnywhere) || modelLoading} onClick={catchSelected}>
-                    {modelLoading ? loadingLabel : pending ? 'Catching…' : 'Catch'}
+                  <Button
+                    disabled={pending || (!inRange && !me?.catchAnywhere) || modelLoading || waitingForQuestion}
+                    onClick={catchSelected}
+                  >
+                    {modelLoading ? loadingLabel : pending ? 'Catching…' : waitingForQuestion ? 'Loading question…' : 'Catch'}
                   </Button>
                 )}
                 <Button variant="ghost" onClick={() => setSelectedId(null)}>

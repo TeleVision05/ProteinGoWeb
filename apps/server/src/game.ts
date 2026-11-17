@@ -47,8 +47,14 @@ function generateCode() {
   return Array.from(bytes, (byte) => ALPHABET[byte % ALPHABET.length]).join('');
 }
 
-function isUniqueViolation(error: unknown) {
-  return typeof error === 'object' && error !== null && 'code' in error && (error as { code: string }).code === '23505';
+/** Postgres "duplicate key" (23505). Drizzle wraps the driver error, so look down the `cause` chain too. */
+export function isUniqueViolation(error: unknown) {
+  let current: unknown = error;
+  for (let depth = 0; depth < 5 && typeof current === 'object' && current !== null; depth++) {
+    if ((current as { code?: unknown }).code === '23505') return true;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return false;
 }
 
 export async function getAccess(userId: string) {

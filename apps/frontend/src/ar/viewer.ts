@@ -5,7 +5,7 @@ import { KTX2Loader } from 'three/addons/loaders/KTX2Loader.js';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { MeshoptDecoder } from 'three/addons/libs/meshopt_decoder.module.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
-import { disposeSprite, factFor, makeFactCard, makeThoughtBubble } from './sprites';
+import { disposeSprite, factFor, makeFactCard, makeQuizPanel, makeThoughtBubble, type QuizPhase } from './sprites';
 
 export type ViewerStatus = 'idle' | 'loading' | 'ready' | 'ar' | 'preview';
 
@@ -16,6 +16,27 @@ export type ViewerEvents = {
   hint(text: string): void;
   dev(lines: string[]): void;
   error(message: string): void;
+  /** A question is waiting to be answered in the scene (true), or it has been answered or closed (false). */
+  challenge?(active: boolean): void;
+};
+
+/** A question asked in the scene before the protein can be caught. */
+export type Challenge = { question: string; options: string[] };
+
+/** What the app says about an answer. `fatal` ends the session (e.g. the catch was refused for another reason). */
+export type ChallengeOutcome =
+  | { ok: true; message?: string }
+  | { ok: false; message: string; retryAfterMs?: number; fatal?: boolean };
+
+type QuizState = {
+  panel: ReturnType<typeof makeQuizPanel>;
+  answer: (index: number) => Promise<ChallengeOutcome>;
+  phase: QuizPhase;
+  picked: number;
+  message: string;
+  /** performance.now() time when options can be tapped again after a wrong answer. */
+  lockedUntil: number;
+  secondsLeft: number;
 };
 
 // Best to worst. Only the protein casts a shadow; the floating UI never does.
@@ -230,6 +251,7 @@ export class ArViewer {
   private readonly bubble = makeThoughtBubble();
   private readonly hitBox = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), new THREE.MeshBasicMaterial({ visible: false }));
   private card: THREE.Mesh | null = null;
+  private quiz: QuizState | null = null;
 
   private readonly raycaster = new THREE.Raycaster();
   // Depth-only floor: writes depth but no colour, so anything below the floor fails the depth test.
@@ -644,7 +666,7 @@ export class ArViewer {
 
   private layout() {
     const m = this.model;
-    this.bubble.visible = !!m && !this.card;
+    this.bubble.visible = !!m && !this.card && !this.quiz;
     this.applyShadowTier();
     if (!m) return;
     const s = this.scale();
@@ -674,6 +696,7 @@ export class ArViewer {
     this.hitBox.scale.copy(m.size);
     this.hitBox.position.set(0, m.size.y / 2, 0);
     if (this.card) this.placeCard();
+    if (this.quiz) this.placeQuiz();
     this.placePanel();
   }
 
@@ -696,7 +719,7 @@ export class ArViewer {
     this.closePanel();
     disposeSprite(this.card);
     this.card = null;
-    this.bubble.visible = !!this.model;
+    this.bubble.visible = !!this.model && !this.quiz;
   }
 
   private openFact() {
@@ -713,6 +736,11 @@ export class ArViewer {
   private tapLearn() {
     if (!this.model) return;
     this.anchorGroup.updateMatrixWorld(true);
+    // While a question is open, taps only answer it: no fun-fact card or controls until it is answered.
+    if (this.quiz) {
+      this.tapQuiz();
+      return;
+    }
     if (this.card) {
       const hit = this.panel ? this.raycaster.intersectObject(this.panel.mesh, false)[0] : undefined;
       if (hit?.uv) this.panelTap(hit.uv.x, 1 - hit.uv.y);
@@ -859,6 +887,7 @@ export class ArViewer {
     this.placed = false;
     this.locked = false;
     this.closeFact();
+    this.clearChallenge();
     this.shrinkCanvas();
     this.events.hint('');
     this.events.dev([]);
@@ -966,7 +995,7 @@ export class ArViewer {
       this.anchorOffset.copy(hitMatrix).invert().multiply(placeMatrix);
       hit.createAnchor().then((a) => { this.anchor = a; }).catch(() => undefined);
     }
-    this.events.hint('Placed! Tap the protein to learn more. Pinch to resize.');
+    this.events.hint(this.quiz ? 'Placed! Tap an answer to catch it.' : 'Placed! Tap the protein to learn more. Pinch to resize.');
     setTimeout(() => { if (this.locked) this.events.hint(''); }, 4500);
   }
 
@@ -1049,6 +1078,7 @@ export class ArViewer {
     }
     this.faceViewer();
     if (this.panel) this.updatePanel(t);
+    if (this.quiz) this.tickQuiz();
 
     // The thought bubble bobs gently so it reads as something to tap.
     if (this.bubble.visible) this.bubble.position.y = this.bubbleBase + this.bubbleBob * Math.sin(t / 380);
@@ -1233,6 +1263,7 @@ export class ArViewer {
     const target = this.mode === 'ar' ? this.viewerPos : this.camera.position;
     if (this.bubble.visible) this.bubble.lookAt(target);
     this.card?.lookAt(target);
+    this.quiz?.panel.mesh.lookAt(target);
     this.panel?.mesh.lookAt(target);
   }
 
@@ -1313,6 +1344,115 @@ export class ArViewer {
       return;
     }
     if (y >= TRACK.y - 28 && y <= TRACK.y + TRACK.h + 28) this.seek((x - TRACK.x) / TRACK.w);
+  }
+
+  // ----------------------------------------------------------------------------------------
+  // Question panel: asked in the scene before the catch, then the usual bubble and controls appear
+  // ----------------------------------------------------------------------------------------
+
+  /**
+   * Ask a question in the scene. `answer` sends the chosen option to the app and resolves with what it says.
+   * Until it is answered right, the "tap to learn more" bubble, the fun-fact card and the animation panel stay away.
+   * Pass null to remove it. Leaving AR or the 3D view always removes it.
+   */
+  setChallenge(challenge: Challenge | null, answer?: (index: number) => Promise<ChallengeOutcome>) {
+    this.clearChallenge();
+    if (!challenge || !answer || challenge.options.length < 2) return;
+    this.closeFact();
+    const panel = makeQuizPanel(challenge.question, challenge.options.slice(0, 4));
+    this.anchorGroup.add(panel.mesh);
+    this.quiz = { panel, answer, phase: 'asking', picked: -1, message: '', lockedUntil: 0, secondsLeft: 0 };
+    this.events.challenge?.(true);
+    this.layout();
+  }
+
+  private clearChallenge() {
+    const q = this.quiz;
+    if (!q) return;
+    this.quiz = null;
+    disposeSprite(q.panel.mesh);
+    this.events.challenge?.(false);
+    this.layout();
+  }
+
+  private placeQuiz() {
+    const q = this.quiz;
+    const m = this.model;
+    if (!q || !m) return;
+    const s = this.scale();
+    const unit = Math.max(m.size.x, m.size.y, m.size.z) * s;
+    const width = unit * 0.62;
+    q.panel.mesh.scale.set(width, width / q.panel.mesh.userData.aspect, 1);
+    q.panel.mesh.position.set(0, m.size.y * s + unit * 0.06, 0);
+  }
+
+  private drawQuiz() {
+    const q = this.quiz;
+    if (!q) return;
+    q.panel.draw({ phase: q.phase, picked: q.picked, message: q.message, secondsLeft: q.secondsLeft });
+  }
+
+  /** The raycaster must already be aimed. */
+  private tapQuiz() {
+    const q = this.quiz;
+    if (!q || !q.panel.mesh.parent) return;
+    const hit = this.raycaster.intersectObject(q.panel.mesh, false)[0];
+    if (!hit?.uv) return;
+    const index = q.panel.hit(hit.uv.x, 1 - hit.uv.y);
+    if (index >= 0) this.submitAnswer(index);
+  }
+
+  private submitAnswer(index: number) {
+    const q = this.quiz;
+    if (!q || q.phase === 'checking' || q.phase === 'correct') return;
+    if (q.phase === 'wrong' && performance.now() < q.lockedUntil) return;
+    q.phase = 'checking';
+    q.picked = index;
+    q.message = '';
+    q.secondsLeft = 0;
+    this.drawQuiz();
+    q.answer(index)
+      .catch((): ChallengeOutcome => ({ ok: false, message: 'Could not check that answer.', retryAfterMs: 3000 }))
+      .then((outcome) => {
+        if (this.quiz !== q) return; // closed while waiting
+        if (outcome.ok) {
+          q.phase = 'correct';
+          q.message = outcome.message ?? 'Correct!';
+          this.drawQuiz();
+          // A moment to read the result, then the protein's usual bubble and controls take over.
+          setTimeout(() => {
+            if (this.quiz !== q) return;
+            this.clearChallenge();
+            this.events.hint('Caught! Tap the protein to learn more.');
+            setTimeout(() => { if (!this.quiz) this.events.hint(''); }, 4500);
+          }, 1800);
+        } else if (outcome.fatal) {
+          this.events.error(outcome.message);
+          this.exit();
+        } else {
+          const wait = outcome.retryAfterMs ?? 5000;
+          q.phase = 'wrong';
+          q.message = outcome.message;
+          q.lockedUntil = performance.now() + wait;
+          q.secondsLeft = Math.ceil(wait / 1000);
+          this.drawQuiz();
+        }
+      });
+  }
+
+  /** Counts the wrong-answer wait down on the panel, then lets the options be tapped again. */
+  private tickQuiz() {
+    const q = this.quiz;
+    if (!q || q.phase !== 'wrong') return;
+    const secs = Math.max(0, Math.ceil((q.lockedUntil - performance.now()) / 1000));
+    if (secs === q.secondsLeft) return;
+    q.secondsLeft = secs;
+    if (secs === 0) {
+      q.phase = 'asking';
+      q.picked = -1;
+      q.message = '';
+    }
+    this.drawQuiz();
   }
 
   /** Two-finger pinch on `el` resizes the protein. */
