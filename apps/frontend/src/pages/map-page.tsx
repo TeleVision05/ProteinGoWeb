@@ -1,6 +1,6 @@
 import { useAr } from '@/components/ar-provider';
 import type { ChallengeOutcome } from '@/ar/viewer';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { HeaderNav, type NavItem } from '@/components/header-nav';
 import { CampusMap } from '@/components/campus-map';
 import { useSession } from '@/components/session';
@@ -47,8 +47,7 @@ export function MapPage() {
   const mapboxToken = import.meta.env.VITE_MAPBOX_TOKEN;
   const ar = useAr();
   const arActive = ar.status === 'ar' || ar.status === 'preview';
-  const arSupported = (ar as unknown as { arSupported?: boolean }).arSupported;
-  const viewLabel = arSupported === false ? 'View in 3D' : 'View in AR';
+  const viewLabel = ar.arSupported ? 'View in AR' : 'View in 3D';
 
   useEffect(() => {
     if (arActive) return;
@@ -174,8 +173,9 @@ export function MapPage() {
   const loadingLabel = ar.progress >= 0 ? `Loading model ${Math.round(ar.progress * 100)}%` : 'Loading model…';
 
   // A quiz protein with a model asks its question in AR, so the question has to be here before the tap.
+  // (On iPhone Safari the question is asked after the hand-off to the App Clip, so it need not be ready here.)
   const waitingForQuestion = Boolean(
-    selected && selected.hasQuiz && !selected.caught && selected.hasModel && challenge?.id !== selected.id,
+    !ar.launchRequired && selected && selected.hasQuiz && !selected.caught && selected.hasModel && challenge?.id !== selected.id,
   );
 
   const select = useCallback((id: string) => {
@@ -184,6 +184,18 @@ export function MapPage() {
     setReward(null);
     setShowNearby(false);
   }, []);
+
+  // Arriving from the Variant Launch App Clip with ?vlspawn=<id>: open that protein so Catch is one tap away.
+  const deepLinkRef = useRef(new URLSearchParams(window.location.search).get('vlspawn'));
+  useEffect(() => {
+    const id = deepLinkRef.current;
+    if (!id || spawns.length === 0) return;
+    deepLinkRef.current = null;
+    if (spawns.some((spawn) => spawn.id === id)) select(id);
+    const url = new URL(window.location.href);
+    url.searchParams.delete('vlspawn');
+    window.history.replaceState(null, '', url);
+  }, [spawns, select]);
 
   function applyCaught(spawn: Spawn, result: CatchResult) {
     setSpawns((current) => current.map((item) => (item.id === spawn.id ? { ...item, caught: true } : item)));
@@ -206,6 +218,11 @@ export function MapPage() {
     const spawn = selected;
     setActionError('');
     setReward(null);
+    if (ar.launchRequired && spawn.hasModel) {
+      // iPhone Safari: one tap goes straight to the App Clip, where the question and the catch happen.
+      ar.enter();
+      return;
+    }
     if (spawn.hasQuiz && spawn.hasModel && modelReady && challenge?.id === spawn.id && challenge.options.length >= 2) {
       // The question is asked in AR itself, on a panel next to the protein. The catch is sent with the answer.
       ar.enter({
@@ -489,7 +506,7 @@ export function MapPage() {
               {reward && reward.spawn.id === selected.id ? <RewardCard reward={reward} onClose={dismissReward} /> : null}
               <div className="flex gap-2">
                 {selected.caught ? (
-                  <Button disabled={!selected.hasModel || !modelReady} onClick={() => ar.enter()}>
+                  <Button disabled={!selected.hasModel || !(modelReady || ar.launchRequired)} onClick={() => ar.enter()}>
                     {modelLoading ? loadingLabel : selected.hasModel ? viewLabel : 'No model yet'}
                   </Button>
                 ) : (
