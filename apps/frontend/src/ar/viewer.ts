@@ -271,6 +271,8 @@ export class ArViewer {
   private refSpace: XRReferenceSpace | null = null;
   private hitTestSource: XRHitTestSource | null = null;
   private viewerSpace: XRReferenceSpace | null = null;
+  // Running inside Variant Launch's iOS viewer. Its ARKit bridge is not ARCore: anchors there have not been verified.
+  private readonly inVariantViewer = typeof navigator !== 'undefined' && navigator.userAgent.includes('Variant Launch');
   // No floor found yet: after a few seconds the hit test is retried with more surface types, and after a few
   // more the player can place the protein in front of them by hand (some AR bridges, e.g. iOS, report no planes).
   private noHitSince = 0;
@@ -1059,7 +1061,9 @@ export class ArViewer {
 
     try { this.anchor?.delete(); } catch { /* already gone */ }
     this.anchor = null;
-    if (hit?.createAnchor) {
+    // Skipped in Variant's viewer: the anchor's pose there can override the placed position and pull the protein
+    // up to the camera. The placed matrix on its own holds, since tracking itself is stable.
+    if (hit?.createAnchor && !this.inVariantViewer) {
       // The anchor keeps the protein glued to the floor while ARCore refines its map.
       this.anchorOffset.copy(hitMatrix).invert().multiply(placeMatrix);
       hit.createAnchor().then((a) => { this.anchor = a; }).catch(() => undefined);
@@ -1631,6 +1635,10 @@ export class ArViewer {
       if (this.modelCounts) lines.push(`model ${(this.modelCounts.vertices / 1e6).toFixed(2)}M verts`);
       lines.push(`tracking ${this.trackingText} (lost ${this.trackingLost}x)`);
       if (this.placed) lines.push(`distance ${this.viewerPos.distanceTo(this.tmpV.setFromMatrixPosition(this.anchorGroup.matrix)).toFixed(2)} m`);
+      const hitDist = this.lastHit ? this.viewerPos.distanceTo(this.tmpV.setFromMatrixPosition(this.lastHitMatrix)) : null;
+      lines.push(`floor hit ${hitDist == null ? 'none' : `${hitDist.toFixed(2)} m`} · reticle ${this.reticle.visible ? 'on' : 'off'} · anchor ${this.anchor ? 'on' : 'off'}`);
+      const proj = this.renderer.xr.getCamera().cameras[0]?.projectionMatrix.elements;
+      lines.push(`fov ${proj ? `${((2 * Math.atan(1 / proj[5])) * 180 / Math.PI).toFixed(0)}°` : '?'} · viewer height ${this.viewerPos.y.toFixed(2)} m · ${this.inVariantViewer ? 'Variant' : 'native'} WebXR`);
     }
     this.fpsText = lines;
     this.events.dev(lines);
