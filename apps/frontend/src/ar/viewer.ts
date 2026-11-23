@@ -271,6 +271,11 @@ export class ArViewer {
   private refSpace: XRReferenceSpace | null = null;
   private hitTestSource: XRHitTestSource | null = null;
   private viewerSpace: XRReferenceSpace | null = null;
+  // Dev diagnostics: an event log (shown under the stats) and the latest per-frame raw XR numbers.
+  private diagLog: string[] = [];
+  private diagListening = false;
+  private hadHit = false;
+  private diagFrame = { hits: 0, hitInfo: '', poseInfo: '', viewInfo: '', hitSource: 'plane' };
   // Running inside Variant Launch's iOS viewer. Its ARKit bridge is not ARCore: anchors there have not been verified.
   private readonly inVariantViewer = typeof navigator !== 'undefined' && navigator.userAgent.includes('Variant Launch');
   // No floor found yet: after a few seconds the hit test is retried with more surface types, and after a few
@@ -833,7 +838,46 @@ export class ArViewer {
     this.startLoop();
   }
 
+  private logDiag(message: string) {
+    this.diagLog.push(`${((performance.now() - this.diagT0) / 1000).toFixed(1)}s ${message}`);
+    if (this.diagLog.length > 40) this.diagLog.shift();
+  }
+
+  private readonly diagT0 = performance.now();
+
+  private static fmtVec(x: number, y: number, z: number) {
+    return `(${x.toFixed(2)}, ${y.toFixed(2)}, ${z.toFixed(2)})`;
+  }
+
+  /** Errors, Variant's own tracking events, and what this device and session actually provide. */
+  private installDiagListeners() {
+    if (this.diagListening) return;
+    this.diagListening = true;
+    window.addEventListener('error', (e) => this.logDiag(`JS error: ${e.message}`));
+    window.addEventListener('unhandledrejection', (e) => this.logDiag(`Promise error: ${String((e as PromiseRejectionEvent).reason)}`));
+    for (const name of ['vlaunch-ar-status', 'vlaunch-ar-tracking']) {
+      window.addEventListener(name, (e) => this.logDiag(`${name}: ${JSON.stringify((e as CustomEvent).detail ?? null).slice(0, 160)}`));
+    }
+  }
+
+  private logSessionInfo(session: XRSession) {
+    const s = session as unknown as Record<string, unknown>;
+    const layer = session.renderState.baseLayer as XRWebGLLayer | undefined;
+    const vl = (window as unknown as { VLaunch?: Record<string, unknown> }).VLaunch;
+    const vlInfo = vl
+      ? Object.entries(vl).filter(([, v]) => ['string', 'boolean', 'number'].includes(typeof v)).map(([k, v]) => `${k}=${String(v)}`).join(' ')
+      : 'none';
+    this.logDiag(`UA ${navigator.userAgent}`);
+    this.logDiag(`screen ${screen.width}x${screen.height} · window ${innerWidth}x${innerHeight} · dpr ${devicePixelRatio} · platform ${navigator.platform}`);
+    this.logDiag(`features ${(s.enabledFeatures as string[] | undefined)?.join(',') ?? '(not reported)'}`);
+    this.logDiag(`blend ${String(s.environmentBlendMode)} · interaction ${String(s.interactionMode)} · visibility ${String(s.visibilityState)}`);
+    this.logDiag(`render near ${session.renderState.depthNear} far ${session.renderState.depthFar} · layer ${layer ? `${layer.framebufferWidth}x${layer.framebufferHeight}` : 'none'}`);
+    this.logDiag(`hit-test API ${'requestHitTestSource' in session} · anchors API ${typeof XRHitTestResult !== 'undefined' && 'createAnchor' in XRHitTestResult.prototype} · plane API ${typeof XRFrame !== 'undefined' && 'detectedPlanes' in XRFrame.prototype}`);
+    this.logDiag(`Variant ${vlInfo}`);
+  }
+
   private async beginSession(session: XRSession) {
+    this.installDiagListeners();
     try {
       this.renderer.xr.setReferenceSpaceType('local');
       this.renderer.xr.setFramebufferScaleFactor(1);
@@ -862,11 +906,17 @@ export class ArViewer {
       this.noHitSince = 0;
       this.hitTestRetried = false;
       this.manualPlaceReady = false;
+      this.logSessionInfo(session);
       try {
         this.hitTestSource = (await session.requestHitTestSource?.({ space: viewerSpace, entityTypes: ['plane'] })) ?? null;
-      } catch {
+        this.diagFrame.hitSource = 'plane';
+      } catch (e) {
+        this.logDiag(`hit test (plane) refused: ${e instanceof Error ? e.message : String(e)}`);
         this.hitTestSource = (await session.requestHitTestSource?.({ space: viewerSpace })) ?? null;
+        this.diagFrame.hitSource = 'default';
       }
+      this.hadHit = false;
+      this.logDiag(`hit test source ${this.hitTestSource ? 'ok' : 'NONE'} (${this.diagFrame.hitSource})`);
       session.addEventListener('select', this.onSelect);
       session.addEventListener('end', this.onSessionEnd);
       this.events.hint('Point at the floor and move the phone slowly…');
@@ -1006,6 +1056,7 @@ export class ArViewer {
       this.tapLearn();
       return;
     }
+    this.logDiag(`tap: floor hit ${this.lastHit ? (this.hitHorizontal ? 'yes' : 'yes, not horizontal') : 'none'} · manual fallback ${this.manualPlaceReady ? 'ready' : 'not ready'}`);
     if (!this.lastHit) {
       if (this.manualPlaceReady) this.placeInFront(ev.frame);
       return;
@@ -1038,8 +1089,11 @@ export class ArViewer {
       if (this.session !== session) { next.cancel(); return; }
       try { this.hitTestSource?.cancel(); } catch { /* already gone */ }
       this.hitTestSource = next;
-    } catch {
+      this.diagFrame.hitSource = 'plane+point';
+      this.logDiag('hit test retried with plane+point: accepted');
+    } catch (e) {
       /* this device only does plane hits: keep the current source */
+      this.logDiag(`hit test retry with plane+point refused: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
 
@@ -1058,6 +1112,10 @@ export class ArViewer {
     this.placedAt = performance.now();
     this.recentDts.length = 0;
     this.reticle.visible = false;
+    this.logDiag(
+      `PLACED (${hit ? 'floor hit' : 'manual in front'}) at ${ArViewer.fmtVec(pos.x, pos.y, pos.z)} · viewer ${ArViewer.fmtVec(this.viewerPos.x, this.viewerPos.y, this.viewerPos.z)} · ` +
+        `${this.viewerPos.distanceTo(pos).toFixed(2)} m away · protein scale ${this.scale().toFixed(3)} · pedestal ${this.pedestalH.toFixed(2)} m`,
+    );
 
     try { this.anchor?.delete(); } catch { /* already gone */ }
     this.anchor = null;
@@ -1091,11 +1149,33 @@ export class ArViewer {
       this.prevPose = cur;
       // Dynamic resolution: ask for a smaller viewport while frames are running late.
       for (const view of viewerPose.views) view.requestViewportScale?.(this.resScale);
+      if (this.devEnabled) {
+        this.diagFrame.poseInfo = `viewer ${ArViewer.fmtVec(p.x, p.y, p.z)} · facing ${ArViewer.fmtVec(
+          ...(() => { const f = new THREE.Vector3(0, 0, -1).applyQuaternion(new THREE.Quaternion(o.x, o.y, o.z, o.w)); return [f.x, f.y, f.z] as [number, number, number]; })(),
+        )} · ${viewerPose.emulatedPosition ? 'emulated' : 'real'} pos`;
+        this.diagFrame.viewInfo = viewerPose.views
+          .map((view) => {
+            const m = view.projectionMatrix;
+            const vp = this.session?.renderState.baseLayer?.getViewport(view);
+            return `${view.eye} fov ${((2 * Math.atan(1 / m[5])) * 180 / Math.PI).toFixed(0)}°v/${((2 * Math.atan(1 / m[0])) * 180 / Math.PI).toFixed(0)}°h vp ${vp ? `${vp.width}x${vp.height}` : '?'}`;
+          })
+          .join(' | ');
+      }
     }
 
     if (this.hitTestSource && !this.locked) {
       const hits = frame.getHitTestResults(this.hitTestSource);
       const pose = hits[0]?.getPose(refSpace);
+      this.diagFrame.hits = hits.length;
+      if (pose && this.devEnabled) {
+        const { position: hp, orientation: ho } = pose.transform;
+        const up = new THREE.Vector3(0, 1, 0).applyQuaternion(new THREE.Quaternion(ho.x, ho.y, ho.z, ho.w));
+        this.diagFrame.hitInfo = `at ${ArViewer.fmtVec(hp.x, hp.y, hp.z)} · normal ${ArViewer.fmtVec(up.x, up.y, up.z)}`;
+      } else if (!pose) this.diagFrame.hitInfo = hits.length ? 'hit but no pose in this space' : '';
+      if (!!(hits.length && pose) !== this.hadHit) {
+        this.hadHit = !!(hits.length && pose);
+        this.logDiag(this.hadHit ? `floor hit FOUND ${this.diagFrame.hitInfo || ''}` : 'floor hit LOST');
+      }
       if (hits.length && pose) {
         this.noHitSince = 0;
         this.manualPlaceReady = false;
@@ -1635,10 +1715,29 @@ export class ArViewer {
       if (this.modelCounts) lines.push(`model ${(this.modelCounts.vertices / 1e6).toFixed(2)}M verts`);
       lines.push(`tracking ${this.trackingText} (lost ${this.trackingLost}x)`);
       if (this.placed) lines.push(`distance ${this.viewerPos.distanceTo(this.tmpV.setFromMatrixPosition(this.anchorGroup.matrix)).toFixed(2)} m`);
+      const d = this.diagFrame;
       const hitDist = this.lastHit ? this.viewerPos.distanceTo(this.tmpV.setFromMatrixPosition(this.lastHitMatrix)) : null;
-      lines.push(`floor hit ${hitDist == null ? 'none' : `${hitDist.toFixed(2)} m`} · reticle ${this.reticle.visible ? 'on' : 'off'} · anchor ${this.anchor ? 'on' : 'off'}`);
-      const proj = this.renderer.xr.getCamera().cameras[0]?.projectionMatrix.elements;
-      lines.push(`fov ${proj ? `${((2 * Math.atan(1 / proj[5])) * 180 / Math.PI).toFixed(0)}°` : '?'} · viewer height ${this.viewerPos.y.toFixed(2)} m · ${this.inVariantViewer ? 'Variant' : 'native'} WebXR`);
+      lines.push('--- floor and placement ---');
+      lines.push(`mode ${this.inVariantViewer ? 'Variant viewer' : 'native WebXR'} · anchors ${this.inVariantViewer ? 'skipped' : 'used'} · anchor now ${this.anchor ? 'on' : 'off'}`);
+      lines.push(`hit source ${d.hitSource} · hits this frame ${d.hits} · retried ${this.hitTestRetried} · manual place ${this.manualPlaceReady ? 'ready' : 'no'}`);
+      lines.push(`floor hit ${hitDist == null ? 'none' : `${hitDist.toFixed(2)} m from viewer ${d.hitInfo}`}`);
+      lines.push(`horizontal ${this.hitHorizontal} · placed ${this.placed} · locked ${this.locked}`);
+      this.reticle.updateWorldMatrix(true, false);
+      const reticleWorld = new THREE.Vector3().setFromMatrixPosition(this.reticle.matrixWorld);
+      lines.push(`reticle ${this.reticle.visible ? 'on' : 'off'} at ${ArViewer.fmtVec(reticleWorld.x, reticleWorld.y, reticleWorld.z)} · ${this.viewerPos.distanceTo(reticleWorld).toFixed(2)} m from viewer`);
+      lines.push('--- camera ---');
+      lines.push(d.poseInfo || 'viewer pose: none');
+      lines.push(`views ${d.viewInfo || '-'}`);
+      lines.push(`ref space ${this.refSpace ? 'ok' : 'none'} · xr presenting ${this.renderer.xr.isPresenting} · three camera near ${this.camera.near} far ${this.camera.far}`);
+      if (this.model) {
+        const s = this.scale();
+        const world = new THREE.Vector3().setFromMatrixPosition(this.anchorGroup.matrixWorld);
+        lines.push('--- model ---');
+        lines.push(`size ${ArViewer.fmtVec(this.model.size.x, this.model.size.y, this.model.size.z)} (raw) · scale ${s.toFixed(3)} · shown ${(Math.max(this.model.size.x, this.model.size.y, this.model.size.z) * s).toFixed(2)} m · pedestal ${this.pedestalH.toFixed(2)} m`);
+        lines.push(`placed at ${ArViewer.fmtVec(world.x, world.y, world.z)} · ${this.viewerPos.distanceTo(world).toFixed(2)} m from viewer · group visible ${this.anchorGroup.visible}`);
+      }
+      lines.push(`--- event log (newest last, ${this.diagLog.length}) ---`);
+      lines.push(...this.diagLog);
     }
     this.fpsText = lines;
     this.events.dev(lines);

@@ -74,6 +74,7 @@ export function ArProvider({ children }: { children: ReactNode }) {
   const [hint, setHint] = useState('');
   const [devLines, setDevLines] = useState<string[]>([]);
   const [devOn, setDevOn] = useState(false);
+  const [copyNote, setCopyNote] = useState('');
   const [clipOn, setClipOn] = useState(true);
   const [autoRes, setAutoRes] = useState(true);
   const [shadow, setShadow] = useState('map');
@@ -262,9 +263,23 @@ export function ArProvider({ children }: { children: ReactNode }) {
             </div>
             {DEBUG_TOOLS && devOn ? (
               <div className="absolute top-[calc(max(0.75rem,env(safe-area-inset-top))+3.25rem)] right-3 grid gap-2">
-                <pre className="pointer-events-none rounded-lg bg-black/60 p-2 font-mono text-[11px] leading-4 text-white">
+                <pre className="pointer-events-auto max-h-[55vh] w-[min(94vw,40rem)] overflow-auto rounded-lg bg-black/70 p-2 font-mono text-[10px] leading-[14px] whitespace-pre-wrap text-white">
                   {devLines.join('\n')}
                 </pre>
+                <button
+                  className={btn}
+                  onClick={() => {
+                    const text = devLines.join('\n');
+                    const done = (ok: boolean) => {
+                      setCopyNote(ok ? 'Copied' : 'Copy failed');
+                      window.setTimeout(() => setCopyNote(''), 1500);
+                    };
+                    if (navigator.clipboard?.writeText) navigator.clipboard.writeText(text).then(() => done(true), () => done(false));
+                    else done(false);
+                  }}
+                >
+                  {copyNote || 'Copy readout'}
+                </button>
                 <button className={btn} onClick={() => setShadow(viewerRef.current?.cycleShadow() ?? 'map')}>
                   Shadow: {shadow}
                 </button>
