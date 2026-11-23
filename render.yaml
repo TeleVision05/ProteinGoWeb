@@ -43,5 +43,8 @@ services:
       # Baked into the frontend at build time. Copy yours from apps/frontend/.env.
       - key: VITE_MAPBOX_TOKEN
         sync: false
+      # Variant Launch SDK key (iPhone AR). Also baked in at build time; copy yours from apps/frontend/.env.
+      - key: VITE_VARIANT_LAUNCH_KEY
+        sync: false
       - key: VITE_ENABLE_DEBUG_TOOLS
         value: "true"

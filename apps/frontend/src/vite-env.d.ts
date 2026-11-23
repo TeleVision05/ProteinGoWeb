@@ -6,6 +6,7 @@ interface ImportMetaEnv {
   readonly VITE_MAPBOX_TOKEN: string;
   readonly VITE_API_URL?: string;
   readonly VITE_ENABLE_DEBUG_TOOLS?: string;
+  readonly VITE_VARIANT_LAUNCH_KEY?: string;
 }
 
 interface ImportMeta {

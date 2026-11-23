@@ -2,6 +2,7 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useRef, use
 import { createPortal } from 'react-dom';
 import { ArViewer, type Challenge, type ChallengeOutcome, type ViewerStatus } from '@/ar/viewer';
 import { apiOrigin, DEBUG_TOOLS } from '@/lib/config';
+import { initVariantLaunch, variantLaunchUrl, type VariantLaunchState } from '@/lib/variant-launch';
 import type { ModelStyle, Spawn, StyleName } from '@/lib/types';
 
 /** A question to answer in the scene before the protein is caught. */
@@ -20,6 +21,8 @@ type ArApi = {
   error: string;
   /** True when this device can run WebXR AR; otherwise the 3D viewer (orbit and zoom) is the fallback. */
   arSupported: boolean;
+  /** True on iPhone Safari: AR opens in the Variant Launch App Clip, so enter() leaves this page. */
+  launchRequired: boolean;
   /** Model styles the prepared protein comes in (e.g. sphere, ribbon). One entry means no toggle. */
   styles: StyleName[];
   /** Style on screen (or loading) now. */
@@ -79,6 +82,10 @@ export function ArProvider({ children }: { children: ReactNode }) {
   const [style, setStyleState] = useState<StyleName | null>(null);
   const [swapping, setSwapping] = useState(false);
   const arSupportedRef = useRef(false);
+  // iPhone Safari: AR opens in the Variant Launch App Clip instead of in this page.
+  const [launchRequired, setLaunchRequired] = useState(false);
+  const launchRequiredRef = useRef(false);
+  const launchStateRef = useRef<VariantLaunchState>({ status: 'off' });
   // The prepared spawn, and the style the player last picked for each protein (survives list refreshes).
   const preparedRef = useRef<Spawn | null>(null);
   const chosenRef = useRef(new Map<string, StyleName>());
@@ -89,10 +96,19 @@ export function ArProvider({ children }: { children: ReactNode }) {
   }, [devOn]);
 
   useEffect(() => {
-    navigator.xr
-      ?.isSessionSupported('immersive-ar')
-      .then((ok) => { arSupportedRef.current = ok; setArSupported(ok); })
-      .catch(() => { arSupportedRef.current = false; setArSupported(false); });
+    // On iPhone the Variant Launch SDK decides: in Safari AR must open in its App Clip; inside the clip WebXR exists.
+    void initVariantLaunch().then((state) => {
+      launchStateRef.current = state;
+      if (state.webXRStatus === 'launch-required') {
+        launchRequiredRef.current = true;
+        setLaunchRequired(true);
+        return;
+      }
+      navigator.xr
+        ?.isSessionSupported('immersive-ar')
+        .then((ok) => { arSupportedRef.current = ok; setArSupported(ok); })
+        .catch(() => { arSupportedRef.current = false; setArSupported(false); });
+    });
   }, []);
 
   useEffect(() => () => {
@@ -125,6 +141,8 @@ export function ArProvider({ children }: { children: ReactNode }) {
       preparedRef.current = spawn;
       setStyles((spawn.styles ?? []).map((item) => item.style));
       setStyleState(entry?.style ?? null);
+      // In launch mode the model is loaded inside the App Clip, so don't download it here too.
+      if (launchRequiredRef.current) return;
       if (!viewer || viewer.loadedId === key) return;
       setError('');
       setProgress(-1);
@@ -168,6 +186,17 @@ export function ArProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const enter = useCallback((options?: EnterOptions) => {
+    if (launchRequiredRef.current) {
+      // iPhone Safari: hand off to the App Clip, which reloads this page on the same protein. The catch and the
+      // question happen there, so nothing is sent from here.
+      const url = variantLaunchUrl(launchStateRef.current, preparedRef.current?.id ?? null);
+      if (url) {
+        window.location.href = url;
+        return;
+      }
+      setError('Could not open the AR viewer. Check your connection and try again.');
+      return;
+    }
     const viewer = viewerRef.current;
     if (!viewer) return;
     setError('');
@@ -187,9 +216,10 @@ export function ArProvider({ children }: { children: ReactNode }) {
 
   const api = useMemo<ArApi>(
     () => ({
-      status, preparedId, progress, error, arSupported, styles, style, swapping, setStyle, prepare, enter, exit,
+      status, preparedId, progress, error, arSupported: arSupported || launchRequired, launchRequired,
+      styles, style, swapping, setStyle, prepare, enter, exit,
     }),
-    [status, preparedId, progress, error, arSupported, styles, style, swapping, setStyle, prepare, enter, exit],
+    [status, preparedId, progress, error, arSupported, launchRequired, styles, style, swapping, setStyle, prepare, enter, exit],
   );
 
   const active = status === 'ar' || status === 'preview';
