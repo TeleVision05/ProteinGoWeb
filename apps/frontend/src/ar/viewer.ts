@@ -270,6 +270,12 @@ export class ArViewer {
   private session: XRSession | null = null;
   private refSpace: XRReferenceSpace | null = null;
   private hitTestSource: XRHitTestSource | null = null;
+  private viewerSpace: XRReferenceSpace | null = null;
+  // No floor found yet: after a few seconds the hit test is retried with more surface types, and after a few
+  // more the player can place the protein in front of them by hand (some AR bridges, e.g. iOS, report no planes).
+  private noHitSince = 0;
+  private hitTestRetried = false;
+  private manualPlaceReady = false;
   private lastHit: XRHitTestResult | null = null;
   private readonly lastHitMatrix = new THREE.Matrix4();
   private hitHorizontal = false;
@@ -850,6 +856,10 @@ export class ArViewer {
       this.setStatus('ar');
 
       const viewerSpace = await session.requestReferenceSpace('viewer');
+      this.viewerSpace = viewerSpace;
+      this.noHitSince = 0;
+      this.hitTestRetried = false;
+      this.manualPlaceReady = false;
       try {
         this.hitTestSource = (await session.requestHitTestSource?.({ space: viewerSpace, entityTypes: ['plane'] })) ?? null;
       } catch {
@@ -891,6 +901,7 @@ export class ArViewer {
     try { this.anchor?.delete(); } catch { /* already gone */ }
     this.session = null;
     this.hitTestSource = null;
+    this.viewerSpace = null;
     this.anchor = null;
     this.lastHit = null;
     this.refSpace = null;
@@ -993,12 +1004,44 @@ export class ArViewer {
       this.tapLearn();
       return;
     }
-    if (!this.lastHit) return;
+    if (!this.lastHit) {
+      if (this.manualPlaceReady) this.placeInFront(ev.frame);
+      return;
+    }
     if (!this.hitHorizontal) { this.events.hint('That surface is not horizontal, aim at the floor'); return; }
     this.place(this.lastHit, this.lastHitMatrix);
   };
 
-  private place(hit: XRHitTestResult, hitMatrix: THREE.Matrix4) {
+  /** Fallback when no floor is ever found: put the protein about 1.5 m ahead, at roughly floor height for a held phone. */
+  private placeInFront(frame: XRFrame) {
+    const pose = this.refSpace ? frame.getViewerPose(this.refSpace) : null;
+    if (!pose) return;
+    const { position: p, orientation: o } = pose.transform;
+    const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(this.tmpQ.set(o.x, o.y, o.z, o.w));
+    forward.y = 0;
+    if (forward.lengthSq() < 1e-4) forward.set(0, 0, -1); // looking straight down: pick any direction
+    forward.normalize().multiplyScalar(1.5);
+    const matrix = new THREE.Matrix4().makeTranslation(p.x + forward.x, p.y - 1.3, p.z + forward.z);
+    this.place(null, matrix);
+  }
+
+  /** Ask for more surface types (estimated planes and feature points) when plain plane hits never arrive. */
+  private async reopenHitTest() {
+    const session = this.session;
+    const space = this.viewerSpace;
+    if (!session || !space || !session.requestHitTestSource) return;
+    try {
+      const next = await session.requestHitTestSource({ space, entityTypes: ['plane', 'point'] });
+      if (!next) return;
+      if (this.session !== session) { next.cancel(); return; }
+      try { this.hitTestSource?.cancel(); } catch { /* already gone */ }
+      this.hitTestSource = next;
+    } catch {
+      /* this device only does plane hits: keep the current source */
+    }
+  }
+
+  private place(hit: XRHitTestResult | null, hitMatrix: THREE.Matrix4) {
     const pos = new THREE.Vector3().setFromMatrixPosition(hitMatrix);
     // Rotate so the protein faces the viewer.
     const yaw = Math.atan2(this.viewerPos.x - pos.x, this.viewerPos.z - pos.z);
@@ -1016,7 +1059,7 @@ export class ArViewer {
 
     try { this.anchor?.delete(); } catch { /* already gone */ }
     this.anchor = null;
-    if (hit.createAnchor) {
+    if (hit?.createAnchor) {
       // The anchor keeps the protein glued to the floor while ARCore refines its map.
       this.anchorOffset.copy(hitMatrix).invert().multiply(placeMatrix);
       hit.createAnchor().then((a) => { this.anchor = a; }).catch(() => undefined);
@@ -1050,6 +1093,8 @@ export class ArViewer {
       const hits = frame.getHitTestResults(this.hitTestSource);
       const pose = hits[0]?.getPose(refSpace);
       if (hits.length && pose) {
+        this.noHitSince = 0;
+        this.manualPlaceReady = false;
         this.lastHit = hits[0];
         this.lastHitMatrix.fromArray(pose.transform.matrix);
         const o = pose.transform.orientation;
@@ -1064,7 +1109,21 @@ export class ArViewer {
       } else {
         this.lastHit = null;
         this.reticle.visible = false;
-        if (this.frameCount % 30 === 0) this.events.hint('Searching for floor… move the phone slowly');
+        const now = performance.now();
+        if (!this.noHitSince) this.noHitSince = now;
+        const waited = now - this.noHitSince;
+        if (waited > 3000 && !this.hitTestRetried) {
+          this.hitTestRetried = true;
+          void this.reopenHitTest();
+        }
+        if (waited > 7000) this.manualPlaceReady = true;
+        if (this.frameCount % 30 === 0) {
+          this.events.hint(
+            this.manualPlaceReady
+              ? 'No floor found. Tap to place the protein in front of you'
+              : 'Searching for floor… move the phone slowly',
+          );
+        }
       }
     }
 
