@@ -2,7 +2,7 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useRef, use
 import { createPortal } from 'react-dom';
 import { ArViewer, type Challenge, type ChallengeOutcome, type ViewerStatus } from '@/ar/viewer';
 import { apiOrigin, DEBUG_TOOLS } from '@/lib/config';
-import { initVariantLaunch, variantLaunchUrl, warmUpCamera, type VariantLaunchState } from '@/lib/variant-launch';
+import { initVariantLaunch, variantLaunchUrl, type VariantLaunchState } from '@/lib/variant-launch';
 import type { ModelStyle, Spawn, StyleName } from '@/lib/types';
 
 /** A question to answer in the scene before the protein is caught. */
@@ -100,7 +100,6 @@ export function ArProvider({ children }: { children: ReactNode }) {
     // On iPhone the Variant Launch SDK decides: in Safari AR must open in its App Clip; inside the clip WebXR exists.
     void initVariantLaunch().then((state) => {
       launchStateRef.current = state;
-      warmUpCamera(); // no-op outside Variant's viewer
       if (state.webXRStatus === 'launch-required') {
         launchRequiredRef.current = true;
         setLaunchRequired(true);
@@ -232,10 +231,12 @@ export function ArProvider({ children }: { children: ReactNode }) {
       {createPortal(
         <>
           {/* Canvas host: shown for the desktop preview, and behind the AR session. */}
+          {/* Black only for the desktop preview. In AR it must be see-through: Variant's iOS viewer moves the canvas
+              behind the page, so an opaque holder that turns visible once AR starts would cover the camera. */}
           <div
             ref={containerRef}
-            className="fixed inset-0 z-50 bg-black"
-            style={{ display: active ? 'block' : 'none' }}
+            className="fixed inset-0 z-50"
+            style={{ display: active ? 'block' : 'none', backgroundColor: status === 'ar' ? 'transparent' : '#000' }}
           />
           {/* DOM overlay root: must sit directly under <body> so the browser can show it in AR. */}
           <div

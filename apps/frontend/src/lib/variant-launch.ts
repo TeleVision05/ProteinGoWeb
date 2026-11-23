@@ -57,26 +57,6 @@ export function initVariantLaunch(): Promise<VariantLaunchState> {
   return started;
 }
 
-/** True when this page is running inside Variant's iOS viewer (the App Clip), where WebXR comes from its polyfill. */
-export const inVariantViewer = typeof navigator !== 'undefined' && navigator.userAgent.includes('Variant Launch');
-
-let cameraWarmed = false;
-
-/**
- * Asks for camera access as soon as the page opens in Variant's viewer, then lets the camera go. The first AR start
- * there showed a black camera until AR was restarted, which fits iOS asking for camera access only at that first
- * start. Settling the permission now means the first start already has it. Safe to call more than once, and a
- * refusal or an unsupported browser is ignored (AR then behaves as before).
- */
-export function warmUpCamera(): void {
-  if (cameraWarmed || !inVariantViewer || !navigator.mediaDevices?.getUserMedia) return;
-  cameraWarmed = true;
-  navigator.mediaDevices
-    .getUserMedia({ video: { facingMode: 'environment' }, audio: false })
-    .then((stream) => stream.getTracks().forEach((track) => track.stop()))
-    .catch(() => undefined);
-}
-
 /** The link that opens this page in the App Clip, with the protein to open once it is there. */
 export function variantLaunchUrl(state: VariantLaunchState, spawnId: string | null): string | null {
   const target = new URL(window.location.href);
