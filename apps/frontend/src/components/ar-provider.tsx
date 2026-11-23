@@ -2,7 +2,7 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useRef, use
 import { createPortal } from 'react-dom';
 import { ArViewer, type Challenge, type ChallengeOutcome, type ViewerStatus } from '@/ar/viewer';
 import { apiOrigin, DEBUG_TOOLS } from '@/lib/config';
-import { initVariantLaunch, variantLaunchUrl, type VariantLaunchState } from '@/lib/variant-launch';
+import { initVariantLaunch, variantLaunchUrl, warmUpCamera, type VariantLaunchState } from '@/lib/variant-launch';
 import type { ModelStyle, Spawn, StyleName } from '@/lib/types';
 
 /** A question to answer in the scene before the protein is caught. */
@@ -100,6 +100,7 @@ export function ArProvider({ children }: { children: ReactNode }) {
     // On iPhone the Variant Launch SDK decides: in Safari AR must open in its App Clip; inside the clip WebXR exists.
     void initVariantLaunch().then((state) => {
       launchStateRef.current = state;
+      warmUpCamera(); // no-op outside Variant's viewer
       if (state.webXRStatus === 'launch-required') {
         launchRequiredRef.current = true;
         setLaunchRequired(true);
