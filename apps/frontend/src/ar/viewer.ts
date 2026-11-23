@@ -286,6 +286,11 @@ export class ArViewer {
   private fovV = 0;
   private fovH = 0;
   private placeScale = 1;
+  // Pinch zoom: scales the whole placed scene (pedestal and protein together), never the protein alone.
+  private pinchScale = 1;
+  private readonly baseMatrix = new THREE.Matrix4();
+  private get sceneScale() { return this.placeScale * this.pinchScale; }
+  private sceneScaleVec() { return new THREE.Vector3(this.sceneScale, this.sceneScale, this.sceneScale); }
   private noHitSince = 0;
   private hitTestRetried = false;
   private manualPlaceReady = false;
@@ -304,7 +309,7 @@ export class ArViewer {
   private lastT = 0;
   private trackingText = '-';
   private clipEnabled = true;
-  private userScale = 1; // set by pinching
+  private userScale = 1; // protein size on its pedestal; fixed at 1 (pinching scales the whole scene, see pinchScale)
   private bubbleBase = 1;
   private bubbleBob = 0.02;
   private animPlaying = true;
@@ -714,7 +719,7 @@ export class ArViewer {
     // Everything floating around the protein is sized from the protein's current size, so it scales with pinch zoom.
     const unit = Math.max(m.size.x, m.size.y, m.size.z) * s;
     // Low-detail copy takes over beyond a few model-sizes away, so it follows the pinch zoom as well.
-    if (m.lod && m.lod.levels[1]) m.lod.levels[1].distance = unit * LOD_SWITCH_SIZES;
+    if (m.lod && m.lod.levels[1]) m.lod.levels[1].distance = unit * LOD_SWITCH_SIZES * this.sceneScale;
     const width = unit * 0.28;
     this.bubbleBase = m.size.y * s + unit * 0.035;
     this.bubbleBob = unit * 0.022;
@@ -916,6 +921,8 @@ export class ArViewer {
 
       const viewerSpace = await session.requestReferenceSpace('viewer');
       this.viewerSpace = viewerSpace;
+      this.pinchScale = 1;
+      this.placeScale = 1;
       this.noHitSince = 0;
       this.hitTestRetried = false;
       this.manualPlaceReady = false;
@@ -1007,9 +1014,19 @@ export class ArViewer {
       this.shadowDirty = true;
     }
     this.raised.getWorldPosition(this.tmpV);
-    this.tmpV.y += (this.model.size.y * this.scale() * this.placeScale) / 2;
+    this.tmpV.y += (this.model.size.y * this.scale() * this.sceneScale) / 2;
+    // The shadow frustum is in world units, so it follows the scene's scale.
+    const worldRadius = this.shadowRadius * this.sceneScale;
+    const shadowCam = this.sun.shadow.camera;
+    if (Math.abs(shadowCam.right - worldRadius) > 1e-4) {
+      shadowCam.left = shadowCam.bottom = -worldRadius;
+      shadowCam.right = shadowCam.top = worldRadius;
+      shadowCam.far = worldRadius * 6;
+      shadowCam.updateProjectionMatrix();
+      this.shadowDirty = true;
+    }
     this.sun.target.position.copy(this.tmpV);
-    this.sun.position.copy(this.tmpV).add(new THREE.Vector3(0.6, 1.6, 0.9).multiplyScalar(this.shadowRadius * 1.5));
+    this.sun.position.copy(this.tmpV).add(new THREE.Vector3(0.6, 1.6, 0.9).multiplyScalar(worldRadius * 1.5));
     this.sun.target.updateMatrixWorld();
     // While the protein animates, refresh the shadow on every 3rd frame; otherwise only when something moved.
     const animating = this.animPlaying && !!this.model.mixer;
@@ -1058,6 +1075,7 @@ export class ArViewer {
     // Lifting fingers after a pinch must not count as a tap.
     if (performance.now() - this.pinchEndedAt < 400) return;
     if (this.locked) {
+      if (this.inVariantViewer) return; // taps come from the screen position instead (onScreenTap)
       if (!this.placed || !this.refSpace) return;
       const pose = ev.frame.getPose(ev.inputSource.targetRaySpace, this.refSpace);
       if (!pose) return;
@@ -1077,6 +1095,16 @@ export class ArViewer {
     if (!this.hitHorizontal) { this.events.hint('That surface is not horizontal, aim at the floor'); return; }
     this.place(this.lastHit, this.lastHitMatrix);
   };
+
+  /** Applies a new pinch zoom to the placed scene. With an anchor, the next frame re-applies the scale on top of it. */
+  private applySceneScale() {
+    if (!this.placed) return;
+    if (!this.anchor) {
+      this.anchorGroup.matrix.copy(this.baseMatrix).scale(this.sceneScaleVec());
+      this.anchorGroup.matrixWorldNeedsUpdate = true;
+    }
+    this.layout();
+  }
 
   /**
    * Shrinks the whole placed scene (pedestal and protein together) when it would not fit the camera's view at the
@@ -1132,12 +1160,11 @@ export class ArViewer {
     // Rotate so the protein faces the viewer.
     const yaw = Math.atan2(this.viewerPos.x - pos.x, this.viewerPos.z - pos.z);
     this.placeScale = this.fitScale(this.viewerPos.distanceTo(pos));
-    const placeMatrix = new THREE.Matrix4().compose(
-      pos,
-      this.tmpQ.setFromAxisAngle(UP, yaw),
-      new THREE.Vector3(this.placeScale, this.placeScale, this.placeScale),
-    );
-    this.anchorGroup.matrix.copy(placeMatrix);
+    // The placed pose is kept without scale; the whole scene (pedestal and protein together) is scaled on top of it.
+    const placeMatrix = new THREE.Matrix4().compose(pos, this.tmpQ.setFromAxisAngle(UP, yaw), new THREE.Vector3(1, 1, 1));
+    this.baseMatrix.copy(placeMatrix);
+    this.anchorGroup.matrix.copy(placeMatrix).scale(this.sceneScaleVec());
+    this.layout();
     this.anchorGroup.matrixWorldNeedsUpdate = true;
     this.anchorGroup.visible = true;
     this.placed = true;
@@ -1254,7 +1281,7 @@ export class ArViewer {
     if (this.anchor && frame.trackedAnchors?.has(this.anchor)) {
       const ap = frame.getPose(this.anchor.anchorSpace, refSpace);
       if (ap) {
-        this.anchorGroup.matrix.multiplyMatrices(this.tmpM.fromArray(ap.transform.matrix), this.anchorOffset);
+        this.anchorGroup.matrix.multiplyMatrices(this.tmpM.fromArray(ap.transform.matrix), this.anchorOffset).scale(this.sceneScaleVec());
         this.anchorGroup.matrixWorldNeedsUpdate = true;
       }
     }
@@ -1667,20 +1694,25 @@ export class ArViewer {
     this.drawQuiz();
   }
 
-  /** Two-finger pinch on `el` resizes the protein. */
+  /**
+   * Two-finger pinch on `el` resizes the whole placed scene (pedestal and protein together). A single tap is also
+   * handled here in Variant's viewer, where the XR `select` event does not carry a usable ray (see onScreenTap).
+   */
   bindPinch(el: HTMLElement) {
     const pointers = new Map<number, { x: number; y: number }>();
     let startDist = 0;
     let startScale = 1;
+    let tap: { id: number; x: number; y: number; t: number; alone: boolean } | null = null;
     const dist = () => {
       const [a, b] = [...pointers.values()];
       return Math.hypot(a.x - b.x, a.y - b.y);
     };
     el.addEventListener('pointerdown', (e) => {
       pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      tap = { id: e.pointerId, x: e.clientX, y: e.clientY, t: performance.now(), alone: pointers.size === 1 };
       if (pointers.size === 2) {
         startDist = dist();
-        startScale = this.userScale;
+        startScale = this.pinchScale;
         this.pinchEndedAt = performance.now() + 1e9; // a pinch is in progress: no taps
       }
     });
@@ -1688,15 +1720,34 @@ export class ArViewer {
       if (!pointers.has(e.pointerId)) return;
       pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
       if (pointers.size !== 2 || startDist < 10) return;
-      this.userScale = Math.min(MAX_USER_SCALE, Math.max(MIN_USER_SCALE, startScale * (dist() / startDist)));
-      this.layout();
+      this.pinchScale = Math.min(MAX_USER_SCALE, Math.max(MIN_USER_SCALE, startScale * (dist() / startDist)));
+      this.applySceneScale();
     });
     const end = (e: PointerEvent) => {
       if (pointers.size >= 2) this.pinchEndedAt = performance.now();
       pointers.delete(e.pointerId);
+      if (e.type === 'pointerup' && tap && tap.id === e.pointerId && tap.alone && pointers.size === 0) {
+        const moved = Math.hypot(e.clientX - tap.x, e.clientY - tap.y);
+        if (moved < 10 && performance.now() - tap.t < 600) this.onScreenTap(e.clientX, e.clientY);
+      }
+      if (pointers.size === 0) tap = null;
     };
     el.addEventListener('pointerup', end);
     el.addEventListener('pointercancel', end);
+  }
+
+  /**
+   * A finger tap in Variant's viewer: aim the ray from the camera through the touched point, then run the normal tap
+   * handling. The polyfill's XR `select` event works for placing on the floor, but its target ray is not reliable
+   * enough to hit the pedestal buttons, so taps on the placed scene are taken from the screen position instead.
+   */
+  private onScreenTap(clientX: number, clientY: number) {
+    if (!this.inVariantViewer || !this.session || !this.placed || !this.locked) return;
+    const xrCamera = this.renderer.xr.getCamera();
+    const cam = (xrCamera.cameras[0] ?? xrCamera) as THREE.PerspectiveCamera;
+    this.raycaster.setFromCamera(new THREE.Vector2((clientX / innerWidth) * 2 - 1, -(clientY / innerHeight) * 2 + 1), cam);
+    this.logDiag(`screen tap at ${Math.round(clientX)},${Math.round(clientY)}`);
+    this.tapLearn();
   }
 
   /** Dev tool: dynamic resolution on/off. Returns the new state. */
@@ -1776,7 +1827,7 @@ export class ArViewer {
         lines.push('--- model ---');
         lines.push(`size ${ArViewer.fmtVec(this.model.size.x, this.model.size.y, this.model.size.z)} (raw) · scale ${s.toFixed(3)} · shown ${(Math.max(this.model.size.x, this.model.size.y, this.model.size.z) * s).toFixed(2)} m · pedestal ${this.pedestalH.toFixed(2)} m`);
         lines.push(`placed at ${ArViewer.fmtVec(world.x, world.y, world.z)} · ${this.viewerPos.distanceTo(world).toFixed(2)} m from viewer · group visible ${this.anchorGroup.visible}`);
-        lines.push(`fit scale ${this.placeScale.toFixed(2)} · view fov ${(this.fovV * 180 / Math.PI).toFixed(0)}°v ${(this.fovH * 180 / Math.PI).toFixed(0)}°h`);
+        lines.push(`scene scale ${this.sceneScale.toFixed(2)} (fit ${this.placeScale.toFixed(2)} × pinch ${this.pinchScale.toFixed(2)}) · view fov ${(this.fovV * 180 / Math.PI).toFixed(0)}°v ${(this.fovH * 180 / Math.PI).toFixed(0)}°h`);
       }
       lines.push(`--- event log (newest last, ${this.diagLog.length}) ---`);
       lines.push(...this.diagLog);
