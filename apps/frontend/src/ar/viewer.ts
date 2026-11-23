@@ -85,6 +85,8 @@ const TARGET_MS = 1000 / TARGET_FPS;
 const TARGET_SIZE = 1.1; // metres, longest side of the protein (before pinch resizing)
 const PEDESTAL_HEIGHT = 0.9; // metres: about waist height, so the screen is easy to reach and read
 const PEDESTAL_MAX = 1.4;
+// Variant's iOS viewer renders into the page canvas, so this caps its pixel density (1.5 keeps a tablet's heavy scenes smooth).
+const AR_CANVAS_MAX_DPR = 1.5;
 const HEIGHT_KEY = 'proteingo.pedestalHeight';
 const MIN_USER_SCALE = 0.2;
 const MAX_USER_SCALE = 5;
@@ -280,6 +282,10 @@ export class ArViewer {
   private readonly inVariantViewer = typeof navigator !== 'undefined' && navigator.userAgent.includes('Variant Launch');
   // No floor found yet: after a few seconds the hit test is retried with more surface types, and after a few
   // more the player can place the protein in front of them by hand (some AR bridges, e.g. iOS, report no planes).
+  // Field of view of the AR camera (radians), and the uniform scale given to the placed protein so it fits that view.
+  private fovV = 0;
+  private fovH = 0;
+  private placeScale = 1;
   private noHitSince = 0;
   private hitTestRetried = false;
   private manualPlaceReady = false;
@@ -802,6 +808,13 @@ export class ArViewer {
   enterAR() {
     if (!this.model || this.session || this.mode === 'ar' || this.mode === 'preview') return;
     if (!navigator.xr) { this.enterPreview(); return; }
+    if (this.inVariantViewer) {
+      // Variant's WebXR polyfill uses the page canvas itself as the AR framebuffer (a native browser allocates its
+      // own). The canvas is parked at 2x2 while idle (see shrinkCanvas), so size it up before the session starts,
+      // or the whole AR view is rendered at 2x2 pixels and comes out blurry.
+      this.renderer.setPixelRatio(Math.min(devicePixelRatio, AR_CANVAS_MAX_DPR));
+      this.renderer.setSize(innerWidth, innerHeight, false);
+    }
     navigator.xr
       .requestSession('immersive-ar', {
         requiredFeatures: ['hit-test'],
@@ -994,7 +1007,7 @@ export class ArViewer {
       this.shadowDirty = true;
     }
     this.raised.getWorldPosition(this.tmpV);
-    this.tmpV.y += (this.model.size.y * this.scale()) / 2;
+    this.tmpV.y += (this.model.size.y * this.scale() * this.placeScale) / 2;
     this.sun.target.position.copy(this.tmpV);
     this.sun.position.copy(this.tmpV).add(new THREE.Vector3(0.6, 1.6, 0.9).multiplyScalar(this.shadowRadius * 1.5));
     this.sun.target.updateMatrixWorld();
@@ -1065,6 +1078,23 @@ export class ArViewer {
     this.place(this.lastHit, this.lastHitMatrix);
   };
 
+  /**
+   * Shrinks the whole placed scene (pedestal and protein together) when it would not fit the camera's view at the
+   * distance it is placed. A tablet held upright sees only about 39 degrees across, so a 1.1 m protein on a pedestal
+   * placed a metre away fills the screen and looks like it is pressed against the camera. Only used in Variant's
+   * viewer, where this has been measured; native WebXR keeps full size.
+   */
+  private fitScale(distance: number) {
+    if (!this.inVariantViewer || !this.model || !this.fovV || !this.fovH) return 1;
+    const d = Math.max(distance, 0.8);
+    const s = this.scale();
+    const width = Math.max(this.model.size.x, this.model.size.y, this.model.size.z) * s;
+    const height = this.pedestalH + this.model.size.y * s;
+    const fitW = (0.6 * 2 * d * Math.tan(this.fovH / 2)) / width;
+    const fitH = (0.6 * 2 * d * Math.tan(this.fovV / 2)) / height;
+    return Math.min(1, Math.max(0.4, Math.min(fitW, fitH)));
+  }
+
   /** Fallback when no floor is ever found: put the protein about 1.5 m ahead, at roughly floor height for a held phone. */
   private placeInFront(frame: XRFrame) {
     const pose = this.refSpace ? frame.getViewerPose(this.refSpace) : null;
@@ -1101,7 +1131,12 @@ export class ArViewer {
     const pos = new THREE.Vector3().setFromMatrixPosition(hitMatrix);
     // Rotate so the protein faces the viewer.
     const yaw = Math.atan2(this.viewerPos.x - pos.x, this.viewerPos.z - pos.z);
-    const placeMatrix = new THREE.Matrix4().compose(pos, this.tmpQ.setFromAxisAngle(UP, yaw), new THREE.Vector3(1, 1, 1));
+    this.placeScale = this.fitScale(this.viewerPos.distanceTo(pos));
+    const placeMatrix = new THREE.Matrix4().compose(
+      pos,
+      this.tmpQ.setFromAxisAngle(UP, yaw),
+      new THREE.Vector3(this.placeScale, this.placeScale, this.placeScale),
+    );
     this.anchorGroup.matrix.copy(placeMatrix);
     this.anchorGroup.matrixWorldNeedsUpdate = true;
     this.anchorGroup.visible = true;
@@ -1149,6 +1184,11 @@ export class ArViewer {
       this.prevPose = cur;
       // Dynamic resolution: ask for a smaller viewport while frames are running late.
       for (const view of viewerPose.views) view.requestViewportScale?.(this.resScale);
+      const proj = viewerPose.views[0]?.projectionMatrix;
+      if (proj && proj[5] > 0 && proj[0] > 0) {
+        this.fovV = 2 * Math.atan(1 / proj[5]);
+        this.fovH = 2 * Math.atan(1 / proj[0]);
+      }
       if (this.devEnabled) {
         this.diagFrame.poseInfo = `viewer ${ArViewer.fmtVec(p.x, p.y, p.z)} · facing ${ArViewer.fmtVec(
           ...(() => { const f = new THREE.Vector3(0, 0, -1).applyQuaternion(new THREE.Quaternion(o.x, o.y, o.z, o.w)); return [f.x, f.y, f.z] as [number, number, number]; })(),
@@ -1726,6 +1766,7 @@ export class ArViewer {
       const reticleWorld = new THREE.Vector3().setFromMatrixPosition(this.reticle.matrixWorld);
       lines.push(`reticle ${this.reticle.visible ? 'on' : 'off'} at ${ArViewer.fmtVec(reticleWorld.x, reticleWorld.y, reticleWorld.z)} · ${this.viewerPos.distanceTo(reticleWorld).toFixed(2)} m from viewer`);
       lines.push('--- camera ---');
+      lines.push(`canvas ${this.renderer.domElement.width}x${this.renderer.domElement.height} (css ${this.renderer.domElement.clientWidth}x${this.renderer.domElement.clientHeight}) · pixel ratio ${this.renderer.getPixelRatio()}`);
       lines.push(d.poseInfo || 'viewer pose: none');
       lines.push(`views ${d.viewInfo || '-'}`);
       lines.push(`ref space ${this.refSpace ? 'ok' : 'none'} · xr presenting ${this.renderer.xr.isPresenting} · three camera near ${this.camera.near} far ${this.camera.far}`);
@@ -1735,6 +1776,7 @@ export class ArViewer {
         lines.push('--- model ---');
         lines.push(`size ${ArViewer.fmtVec(this.model.size.x, this.model.size.y, this.model.size.z)} (raw) · scale ${s.toFixed(3)} · shown ${(Math.max(this.model.size.x, this.model.size.y, this.model.size.z) * s).toFixed(2)} m · pedestal ${this.pedestalH.toFixed(2)} m`);
         lines.push(`placed at ${ArViewer.fmtVec(world.x, world.y, world.z)} · ${this.viewerPos.distanceTo(world).toFixed(2)} m from viewer · group visible ${this.anchorGroup.visible}`);
+        lines.push(`fit scale ${this.placeScale.toFixed(2)} · view fov ${(this.fovV * 180 / Math.PI).toFixed(0)}°v ${(this.fovH * 180 / Math.PI).toFixed(0)}°h`);
       }
       lines.push(`--- event log (newest last, ${this.diagLog.length}) ---`);
       lines.push(...this.diagLog);
