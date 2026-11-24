@@ -10,8 +10,10 @@ import { accessCode, capture, codeRedemption, spawn } from '../db/game-schema';
 import {
   GameError,
   catchSpawn,
+  cloudHintCenter,
   createCode,
   createSpawn,
+  distanceMeters,
   getChallenge,
   getCollection,
   getLeaderboard,
@@ -258,6 +260,91 @@ describe('leaderboard setting', () => {
 
   it('rejects a setting that is not a boolean', async () => {
     await assert.rejects(updateSettings({ leaderboardEnabled: 'yes' as unknown as boolean }), GameError);
+  });
+});
+
+describe('dynamic cloud cover', () => {
+  const originalCloud = { enabled: false, dissolve: 120, hint: 350, transparency: 15 };
+  const CAMPUS = { latitude: 33.9737, longitude: -117.3281 };
+
+  before(async () => {
+    const s = await getSettings();
+    originalCloud.enabled = s.cloudsEnabled;
+    originalCloud.dissolve = s.cloudDissolveRadius;
+    originalCloud.hint = s.cloudHintRadius;
+    originalCloud.transparency = s.cloudTransparency;
+  });
+
+  after(async () => {
+    await updateSettings({
+      cloudsEnabled: originalCloud.enabled,
+      cloudDissolveRadius: originalCloud.dissolve,
+      cloudHintRadius: originalCloud.hint,
+      cloudTransparency: originalCloud.transparency,
+    });
+  });
+
+  it('is off by default and saves each setting', async () => {
+    const saved = await updateSettings({ cloudsEnabled: true, cloudDissolveRadius: 150, cloudHintRadius: 400, cloudTransparency: 30 });
+    assert.equal(saved.cloudsEnabled, true);
+    assert.equal(saved.cloudDissolveRadius, 150);
+    assert.equal(saved.cloudHintRadius, 400);
+    assert.equal(saved.cloudTransparency, 30);
+    assert.equal((await updateSettings({ cloudsEnabled: false })).cloudsEnabled, false);
+  });
+
+  it('rejects numbers outside the allowed range', async () => {
+    await fails(updateSettings({ cloudDissolveRadius: 5 }), 400, /Dissolve radius/);
+    await fails(updateSettings({ cloudHintRadius: 99999 }), 400, /Hint radius/);
+    await fails(updateSettings({ cloudTransparency: 100 }), 400, /transparency/i);
+    await fails(updateSettings({ cloudDissolveRadius: 'wide' as unknown as number }), 400);
+  });
+
+  it('keeps the hint center away from the real spot, the same every time, and inside the hint radius', () => {
+    const a = cloudHintCenter('some-spawn', CAMPUS.latitude, CAMPUS.longitude, 400);
+    const b = cloudHintCenter('some-spawn', CAMPUS.latitude, CAMPUS.longitude, 400);
+    assert.deepEqual(a, b);
+    const away = distanceMeters(CAMPUS.latitude, CAMPUS.longitude, a.latitude, a.longitude);
+    assert.ok(away >= 0.19 * 400 && away <= 0.51 * 400, `nudged ${away} m`);
+    const other = cloudHintCenter('another-spawn', CAMPUS.latitude, CAMPUS.longitude, 400);
+    assert.notDeepEqual(a, other);
+  });
+
+  it('hides the real place of far proteins and keeps near ones exact', async () => {
+    await updateSettings({ cloudsEnabled: true, cloudDissolveRadius: 100, cloudHintRadius: 400 });
+    const near = await makeSpawn({ name: 'Cloud near', summary: 'by the fountain' });
+    // About 600 m north of the near one.
+    const far = await makeSpawn({ name: 'Cloud far', summary: 'behind the library', latitude: near.latitude + 0.0054 });
+    const list = await listPlaySpawns(userIds[0], { latitude: near.latitude, longitude: near.longitude });
+    const seenNear = list.find((s) => s.id === near.id);
+    const seenFar = list.find((s) => s.id === far.id);
+    assert.ok(seenNear && seenFar);
+    assert.equal(seenNear.hidden, false);
+    assert.equal(seenNear.latitude, near.latitude);
+    assert.equal(seenNear.summary, 'by the fountain');
+    assert.equal(seenFar.hidden, true);
+    assert.notEqual(seenFar.latitude, far.latitude);
+    assert.equal(seenFar.summary, null);
+    // The nudged spot is still near enough that the hint glow covers the real one.
+    assert.ok(distanceMeters(far.latitude, far.longitude, seenFar.latitude, seenFar.longitude) <= 0.51 * 400);
+
+    // Without a position everything is hidden; with cloud cover off nothing is.
+    const blind = await listPlaySpawns(userIds[0], null);
+    assert.ok(blind.filter((s) => [near.id, far.id].includes(s.id)).every((s) => s.hidden));
+    await updateSettings({ cloudsEnabled: false });
+    const plain = await listPlaySpawns(userIds[0], null);
+    assert.ok(plain.filter((s) => [near.id, far.id].includes(s.id)).every((s) => !s.hidden));
+  });
+
+  it('does not hide anything in the catch-anywhere test mode', async () => {
+    await updateSettings({ cloudsEnabled: true });
+    process.env.CATCH_ANYWHERE = 'true';
+    try {
+      const list = await listPlaySpawns(userIds[0], null);
+      assert.ok(list.every((s) => !s.hidden));
+    } finally {
+      process.env.CATCH_ANYWHERE = 'false';
+    }
   });
 });
 

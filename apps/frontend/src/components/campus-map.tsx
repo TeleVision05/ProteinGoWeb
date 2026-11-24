@@ -1,8 +1,12 @@
 import 'mapbox-gl/dist/mapbox-gl.css';
 import { useEffect, useMemo, useRef } from 'react';
 import Map, { Layer, Marker, Source, type MapRef } from 'react-map-gl/mapbox';
-import { circlePolygon, RARITY_HEX, UCR } from '@/lib/utils';
+import { CloudLayer } from '@/components/cloud-layer';
+import { circlePolygon, distanceMeters, RARITY_HEX, UCR } from '@/lib/utils';
 import type { Spawn } from '@/lib/types';
+
+/** Must match the server's margin: it sends the real place of a protein only within the dissolve radius plus this. */
+const CLOUD_MARKER_MARGIN = 60;
 
 type Props = {
   token: string;
@@ -24,6 +28,8 @@ type Props = {
   showCoverage?: boolean;
   /** Admin: catch density points. */
   heatmap?: { latitude: number; longitude: number; weight: number }[] | null;
+  /** Player map: cover the whole map in clouds that dissolve around the player and glow where proteins hide. */
+  clouds?: { dissolveRadius: number; hintRadius: number; transparency: number } | null;
   onSelect: (id: string) => void;
   onPick?: (point: { lat: number; lng: number }) => void;
   className?: string;
@@ -43,6 +49,7 @@ export function CampusMap({
   onMove,
   showCoverage,
   heatmap,
+  clouds,
   onSelect,
   onPick,
   className,
@@ -94,9 +101,30 @@ export function CampusMap({
     [heatmap],
   );
 
+  const colorOf = (spawn: Spawn) => (rarityColors ? (RARITY_HEX[spawn.rarity] ?? RARITY_HEX.common) : RARITY_HEX.common);
+  // Under clouds: a protein shows as a marker only inside the cleared circle around the player. Every other one
+  // (and any the server marked hidden) is only a colored glow in the clouds, and not once it has been caught.
+  const markers = clouds
+    ? spawns.filter(
+        (spawn) =>
+          !spawn.hidden && user != null && distanceMeters(user.lat, user.lng, spawn.latitude, spawn.longitude) <= clouds.dissolveRadius + CLOUD_MARKER_MARGIN,
+      )
+    : spawns;
+  const hints = useMemo(
+    () =>
+      clouds
+        ? spawns
+            .filter((spawn) => !spawn.caught)
+            .filter((spawn) => spawn.hidden || user == null || distanceMeters(user.lat, user.lng, spawn.latitude, spawn.longitude) > clouds.dissolveRadius + CLOUD_MARKER_MARGIN)
+            .map((spawn) => ({ lat: spawn.latitude, lng: spawn.longitude, color: colorOf(spawn) }))
+        : [],
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [clouds, spawns, user, rarityColors],
+  );
+
   const center = user ?? UCR;
   return (
-    <div className={className}>
+    <div className={className} style={{ position: 'relative' }}>
       <Map
         ref={mapRef}
         mapboxAccessToken={token}
@@ -135,14 +163,14 @@ export function CampusMap({
         ) : null}
         {user ? <Dot lat={user.lat} lng={user.lng} color="#f4f7fb" size={16} title="You" z={2} /> : null}
         {draft ? <Dot lat={draft.lat} lng={draft.lng} color="#ffffff" size={14} title="New spawn" /> : null}
-        {spawns.map((spawn) => (
+        {markers.map((spawn) => (
           <Dot
             key={spawn.id}
             lat={spawn.latitude}
             lng={spawn.longitude}
             title={spawn.name}
             z={selectedId === spawn.id ? 3 : 1}
-            color={rarityColors ? (RARITY_HEX[spawn.rarity] ?? RARITY_HEX.common) : RARITY_HEX.common}
+            color={colorOf(spawn)}
             faded={spawn.caught}
             selected={selectedId === spawn.id}
             size={selectedId === spawn.id ? 26 : 18}
@@ -152,6 +180,16 @@ export function CampusMap({
           />
         ))}
       </Map>
+      {clouds ? (
+        <CloudLayer
+          mapRef={mapRef}
+          user={user}
+          dissolveRadius={clouds.dissolveRadius}
+          hintRadius={clouds.hintRadius}
+          transparency={clouds.transparency}
+          hints={hints}
+        />
+      ) : null}
     </div>
   );
 }

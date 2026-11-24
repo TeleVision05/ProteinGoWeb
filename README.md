@@ -20,7 +20,10 @@ streaks and achievements, and fill a personal collection.
   an optional low-detail LOD).
 - Quiz question, rarity and catch radius per protein; scatter many proteins across an area at once.
 - Map layers (catch heatmap, coverage), filters, class access codes.
-- Settings: turn the leaderboard and rarity levels on or off.
+- Settings: turn the leaderboard and rarity levels on or off, and **Dynamic cloud cover**: clouds cover the players' whole
+  map and dissolve in a circle around them as they walk. Proteins outside it are hidden (the server only sends their real
+  place when a player is near), and a large glow in the protein's color shows roughly where one is. Dissolve radius, hint
+  radius and cloud transparency are adjustable.
 
 **Anti-cheat**: catch rate limit, GPS accuracy limit, impossible-travel check, and a cooldown after a wrong answer.
 
