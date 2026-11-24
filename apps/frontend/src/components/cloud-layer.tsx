@@ -72,28 +72,68 @@ float fbm(vec2 p) {
   }
   return s;
 }
+// A field of overlapping round domes (hemispheres) around jittered points: the bulbs of a cumulus cloud.
+// Returns the height in .x and the slope in .yz, so the shading can use each dome's real surface angle.
+vec3 domes(vec2 p, float t) {
+  vec2 i = floor(p);
+  vec2 f = fract(p);
+  float hsum = 0.0, wsum = 0.0;
+  vec2 ssum = vec2(0.0);
+  for (int y = -1; y <= 1; y++) {
+    for (int x = -1; x <= 1; x++) {
+      vec2 g = vec2(float(x), float(y));
+      vec2 cell = i + g;
+      float h1 = hash(cell);
+      float h2 = hash(cell + 19.7);
+      float h3 = hash(cell + 7.1);
+      // Each bulb slowly breathes: its center wanders a little around its home spot.
+      vec2 c = vec2(0.2 + 0.6 * h1, 0.2 + 0.6 * h2) + 0.14 * vec2(sin(t * 0.17 + 6.283 * h2), cos(t * 0.13 + 6.283 * h1));
+      float rad = 0.62 + 0.45 * h3;
+      vec2 d = g + c - f;                          // from this pixel to the bulb's center
+      float r2 = dot(d, d) / (rad * rad);
+      if (r2 < 1.0) {
+        float dome = sqrt(1.0 - r2) * rad;         // height of a hemisphere
+        float wgt = dome * dome * dome;            // taller bulbs count for more where two overlap: a soft union
+        hsum += wgt * dome;
+        ssum += wgt * (d / max(dome, 0.15));
+        wsum += wgt;
+      }
+    }
+  }
+  float inv = 1.0 / max(wsum, 0.0001);
+  return vec3(hsum * inv, ssum * inv);
+}
 
 void main() {
   vec2 w = mix(mix(uBL, uBR, vUv.x), mix(uTL, uTR, vUv.x), vUv.y);
   float t = uTime;
 
-  // Clouds about 300 m across, drifting slowly and slowly changing shape (the warp moves against the wind).
-  vec2 q = w / 280.0;
-  float warp = fbm(q * 0.55 + vec2(-t * 0.004, t * 0.003) + 7.3);
-  vec2 qq = q + vec2(t * 0.010, t * 0.0045) + warp * 0.8;
-  float n = fbm(qq);
-  float nl = fbm(qq + vec2(-0.10, 0.12));            // the same cloud, a step toward the light (up and left)
-  float dens = smoothstep(0.32, 0.70, n);
-  float lit = clamp(0.60 + (n - nl) * 6.5, 0.0, 1.0); // brighter where the cloud rises toward the light
+  // Bulbs about 150 m across, drifting slowly and gently changing (the warp moves against the wind).
+  vec2 q = w / 300.0;
+  float warp = fbm(q * 0.5 + vec2(-t * 0.004, t * 0.003) + 7.3);
+  vec2 qq = q + vec2(t * 0.010, t * 0.004) + warp * 0.5;
+  // Wobble the shapes so the bulbs are lumpy and irregular rather than neat rounds.
+  qq += 0.30 * (vec2(fbm(qq * 1.9 + 2.1), fbm(qq * 1.9 + 8.7)) - 0.5);
+  float big = fbm(qq * 0.45 + 3.1);                       // large-scale variation, used for the ragged edges
 
-  vec3 shade = vec3(0.72, 0.79, 0.90);
+  vec3 bulbs = domes(qq, t);                              // big bulbs
+  vec3 fine = domes(qq * 2.3 + 5.7, t * 1.3);             // small bulbs growing on them
+  float height = bulbs.x + 0.22 * fine.x;
+  vec2 slope = bulbs.yz + 0.25 * fine.yz;
+
+  // Lit from the up-left: bright on the side of each bulb that faces the light, soft blue-grey on the other side.
+  vec3 normal = normalize(vec3(-slope, 1.3));
+  vec3 toLight = normalize(vec3(-0.45, 0.6, 0.65));
+  float diffuse = clamp(dot(normal, toLight), 0.0, 1.0);
+  float open = smoothstep(0.0, 0.40, height);             // the gaps and creases between bulbs are darker
+  vec3 shade = vec3(0.60, 0.70, 0.86);
   vec3 light = vec3(1.0, 1.0, 1.0);
-  vec3 col = mix(shade, light, clamp(lit * (0.5 + 0.5 * dens) + 0.12, 0.0, 1.0));
-  float body = 0.74 + 0.26 * dens;                    // always some cloud everywhere, thicker in the clumps
+  vec3 col = mix(shade, light, clamp(diffuse * 0.95 + 0.10, 0.0, 1.0) * mix(0.55, 1.0, open));
+  float body = 1.0;                                       // solid: the clouds do not show the map through them
 
   // Clear circle around the player, with a ragged, wispy edge.
   float d = length(w - uUser);
-  float edge = d + (n - 0.5) * uDissolve * 0.7;
+  float edge = d + (big - 0.5) * uDissolve * 0.7;
   float cover = mix(1.0, smoothstep(uDissolve, uDissolve * 1.45, edge), uHasUser);
 
   // A big soft glow in the protein's color, centered near (not on) each hidden protein.
@@ -102,7 +142,7 @@ void main() {
   for (int i = 0; i < ${MAX_HINTS}; i++) {
     if (i >= uCount) break;
     float r = uHint[i].z;
-    float dist = length(w - uHint[i].xy) + (n - 0.5) * r * 0.35;
+    float dist = length(w - uHint[i].xy) + (big - 0.5) * r * 0.35;
     float g = 1.0 - smoothstep(0.0, r, dist);
     g = g * g * (3.0 - 2.0 * g);
     acc += uHintColor[i] * g;
@@ -112,7 +152,6 @@ void main() {
   vec3 hintCol = acc / max(wsum, 0.001);
   float pulse = 0.9 + 0.1 * sin(t * 0.9);
   col = mix(col, hintCol, amt * 0.7 * pulse);
-  body = max(body, 0.5 + 0.4 * amt);                  // keep the glow visible through thin cloud
 
   float a = cover * body * uOpacity;
   gl_FragColor = vec4(col * a, a);                    // premultiplied
