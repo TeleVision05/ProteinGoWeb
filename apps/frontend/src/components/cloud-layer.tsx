@@ -34,8 +34,14 @@ const FRAME_MS = 1000 / 30;
 /** The explored mask covers a square this many meters on a side around the campus point, at MASK_SIZE pixels. */
 const MASK_SPAN = 6000;
 const MASK_SIZE = 1024;
-/** Explored ground fades back to fog over a wide band: fully clear to the dissolve radius, gone at this many times it. */
-const FADE_OUT = 1.8;
+/**
+ * How the fog comes back with distance from cleared ground, in multiples of the dissolve radius: fully clear in the
+ * middle, then a long, gentle bell-shaped tail (no visible edge) that is gone by FADE_OUT. The shader uses the same
+ * numbers, so the live circle and the remembered ground match.
+ */
+const CLEAR_CORE = 0.6;
+const CLEAR_SPREAD = 0.9;
+const FADE_OUT = 2.4;
 
 // Local meters from a fixed point on campus: small numbers keep the shader's math precise.
 const M_PER_DEG_LAT = 110_574;
@@ -113,14 +119,15 @@ void main() {
   float big = banks;                                                 // used below for the ragged edges
   float body = 1.0;                                                  // solid: the map does not show through at 0% transparency
 
-  // Where the player is now: fully clear within the dissolve radius, then a long soft fade back into fog.
+  // Where the player is now: clear in the middle, then the fog creeps back in a long, gentle bell-shaped tail.
   float d = length(w - uUser);
-  float edge = d + (big - 0.5) * uDissolve * 0.6;
-  float live = mix(1.0, smoother(uDissolve, uDissolve * ${FADE_OUT.toFixed(1)}, edge), uHasUser);
-  // Where the player has been before: stays cleared, with the same soft, slightly wispy edge.
-  vec2 mw = w + (big - 0.5) * uDissolve * 0.5;
+  float edge = d + (big - 0.5) * uDissolve * 0.5;
+  float away = max(edge - uDissolve * ${CLEAR_CORE.toFixed(2)}, 0.0) / (uDissolve * ${CLEAR_SPREAD.toFixed(2)});
+  float live = mix(1.0, 1.0 - exp(-away * away), uHasUser);
+  // Where the player has been before: stays cleared, with the same long soft tail.
+  vec2 mw = w + (big - 0.5) * uDissolve * 0.4;
   float seen = texture2D(uExplored, (mw + ${(MASK_SPAN / 2).toFixed(1)}) / ${MASK_SPAN.toFixed(1)}).r;
-  float cover = min(live, 1.0 - smoothstep(0.1, 0.9, seen));
+  float cover = min(live, 1.0 - seen);
 
   // A big soft glow in the protein's color, centered near (not on) each hidden protein.
   vec3 acc = vec3(0.0);
@@ -129,16 +136,16 @@ void main() {
     if (i >= uCount) break;
     float r = uHint[i].z;
     float dist = length(w - uHint[i].xy) + (big - 0.5) * r * 0.35;
-    // A wide, gentle bell: strongest in the middle and fading gradually all the way out to the radius.
-    float x = clamp(dist / r, 0.0, 1.0);
-    float g = max(0.0, (exp(-2.6 * x * x) - 0.0743) / 0.9257);
+    // A very wide, gentle bell: strongest in the middle and fading gradually, with no visible edge, out past the radius.
+    float x = clamp(dist / (r * 1.35), 0.0, 1.0);
+    float g = max(0.0, (exp(-1.8 * x * x) - 0.1653) / 0.8347);
     acc += uHintColor[i] * g;
     wsum += g;
   }
   float amt = clamp(wsum, 0.0, 1.0);
   vec3 hintCol = acc / max(wsum, 0.001);
   float pulse = 0.9 + 0.1 * sin(t * 0.9);
-  col = mix(col, hintCol, amt * 0.7 * pulse);
+  col = mix(col, hintCol, amt * 0.62 * pulse);
 
   float a = cover * body * uOpacity;
   gl_FragColor = vec4(col * a, a);                    // premultiplied
@@ -246,13 +253,14 @@ export function CloudLayer(props: Props) {
       const y = (MASK_SPAN / 2 - (cy + 0.5) * cellMeters) * scale;
       const r = radius * FADE_OUT * scale;
       const g = maskCtx.createRadialGradient(x, y, 0, x, y, r);
-      // Clear out to the dissolve radius, then an eased fade to nothing at FADE_OUT times that.
-      const clear = 1 / FADE_OUT;
-      g.addColorStop(0, '#fff');
-      g.addColorStop(clear, '#fff');
-      [[0.12, '#ebebeb'], [0.32, '#b8b8b8'], [0.55, '#666'], [0.78, '#242424'], [1, '#000']].forEach(([t, color]) =>
-        g.addColorStop(clear + (1 - clear) * (t as number), color as string),
-      );
+      // The same bell-shaped tail as the live circle, sampled along the radius.
+      const steps = 16;
+      for (let i = 0; i <= steps; i++) {
+        const t = i / steps;
+        const away = Math.max(0, t * FADE_OUT - CLEAR_CORE) / CLEAR_SPREAD;
+        const level = i === steps ? 0 : Math.round(255 * Math.exp(-away * away));
+        g.addColorStop(t, `rgb(${level},${level},${level})`);
+      }
       maskCtx.fillStyle = g;
       maskCtx.fillRect(x - r, y - r, r * 2, r * 2);
     };

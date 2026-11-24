@@ -356,8 +356,11 @@ function activeSpawnFilter(now: Date) {
 }
 
 const CLOUD_SECRET = process.env.BETTER_AUTH_SECRET || 'proteingo-clouds';
-/** How far past the dissolve radius a protein must be before its place is hidden (covers GPS drift and walking between refreshes). */
-const CLOUD_HIDE_MARGIN_METERS = 60;
+/**
+ * A protein is shown for real up to this many times the dissolve radius from the player. The fog is still thin there
+ * (the map's fog fades back gradually past the radius), and the extra covers GPS drift and walking between refreshes.
+ */
+const CLOUD_REVEAL_FACTOR = 1.25;
 
 /**
  * Where the cloud's colored hint is centered for a hidden protein: the real spot nudged by a fixed random amount
@@ -448,7 +451,7 @@ function exploredNear(cells: Set<string>, latitude: number, longitude: number, r
 
 /**
  * The spawns a player sees. With dynamic cloud cover on, a protein is only shown for real when the player is within the
- * dissolve radius of it now, or has explored the ground it stands on (the fog stays cleared there). Any other protein
+ * dissolve radius (a little past it) of it now, or has explored the ground it stands on (the fog stays cleared there). Any other protein
  * is sent with a nudged location and no summary (hidden: true), so its real position is not in the response at all.
  * The game's own rules still use the real position on the server.
  */
@@ -466,7 +469,7 @@ export async function listPlaySpawns(userId: string, here?: { latitude: number; 
     const near =
       here != null &&
       distanceMeters(here.latitude, here.longitude, row.latitude, row.longitude) <=
-        settings.cloudDissolveRadius + CLOUD_HIDE_MARGIN_METERS;
+        settings.cloudDissolveRadius * CLOUD_REVEAL_FACTOR;
     if (near || exploredNear(explored, row.latitude, row.longitude, settings.cloudDissolveRadius)) {
       return { ...view, hidden: false };
     }

@@ -682,7 +682,7 @@ export function AdminPage() {
                   step={10}
                   value={settings.cloudDissolveRadius}
                   onCommit={(value) => void saveSetting({ cloudDissolveRadius: value })}
-                  help="How far around the player the clouds are fully gone, fading back to cloud beyond that. Ground they have walked through stays cleared, and proteins on it show as normal markers."
+                  help="How far around the player the fog is mostly gone. It is clear in the middle and thickens gradually, with no hard edge, out to about twice this. Ground they have walked through stays cleared, and proteins on it show as normal markers."
                 />
                 <RangeSetting
                   id="cloud-hint"
