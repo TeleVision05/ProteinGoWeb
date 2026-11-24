@@ -1,7 +1,8 @@
+import { createHmac } from 'node:crypto';
 import { and, desc, eq, gt, inArray, isNull, or, sql } from 'drizzle-orm';
 import { db } from './db/db';
 import { user } from './db/auth-schema';
-import { accessCode, appSetting, capture, codeRedemption, spawn, type ModelVariant } from './db/game-schema';
+import { accessCode, appSetting, capture, codeRedemption, exploredCell, spawn, type ModelVariant } from './db/game-schema';
 import { buildAchievements, isRarity, levelFor, publicName, rewardFor, streaks, RARITIES, type ProgressStats, type Rarity } from './progress';
 import { rateLimited } from './rate-limit';
 import { deleteModel, putModel, readBundledModel, readModel } from './storage';
@@ -354,13 +355,127 @@ function activeSpawnFilter(now: Date) {
   return or(isNull(spawn.expiresAt), gt(spawn.expiresAt, now));
 }
 
-export async function listPlaySpawns(userId: string) {
+const CLOUD_SECRET = process.env.BETTER_AUTH_SECRET || 'proteingo-clouds';
+/**
+ * A protein is shown for real up to this many times the dissolve radius from the player. The fog is still thin there
+ * (the map's fog fades back gradually past the radius), and the extra covers GPS drift and walking between refreshes.
+ */
+const CLOUD_REVEAL_FACTOR = 1.25;
+
+/**
+ * Where the cloud's colored hint is centered for a hidden protein: the real spot nudged by a fixed random amount
+ * (20% to 50% of the hint radius, in a random direction), so the middle of the glow is not the protein. The nudge
+ * comes from a keyed hash, so it never changes between refreshes (no averaging it away) and players cannot work it out.
+ */
+export function cloudHintCenter(id: string, latitude: number, longitude: number, hintRadius: number) {
+  const digest = createHmac('sha256', CLOUD_SECRET).update(id).digest();
+  const angle = (digest.readUInt16BE(0) / 65535) * 2 * Math.PI;
+  const meters = (0.2 + 0.3 * (digest.readUInt16BE(2) / 65535)) * hintRadius;
+  const metersPerDegreeLng = 111_320 * Math.max(0.01, Math.cos((latitude * Math.PI) / 180));
+  return {
+    latitude: latitude + (Math.cos(angle) * meters) / 110_574,
+    longitude: longitude + (Math.sin(angle) * meters) / metersPerDegreeLng,
+  };
+}
+
+/**
+ * The explored grid. Squares are 25 m, counted east and north from a fixed point on campus (the app's map must use
+ * the same point and size; it reads them from GET /api/explored). Squares more than 3 km out are ignored.
+ */
+export const EXPLORE = { originLat: 33.9737, originLng: -117.3281, cellMeters: 25, maxCell: 120 } as const;
+
+export function exploreCellOf(latitude: number, longitude: number) {
+  const east = (longitude - EXPLORE.originLng) * 111_320 * Math.cos((EXPLORE.originLat * Math.PI) / 180);
+  const north = (latitude - EXPLORE.originLat) * 110_574;
+  const cx = Math.floor(east / EXPLORE.cellMeters);
+  const cy = Math.floor(north / EXPLORE.cellMeters);
+  if (Math.abs(cx) > EXPLORE.maxCell || Math.abs(cy) > EXPLORE.maxCell) return null;
+  return { cx, cy };
+}
+
+export function exploreCellCenter(cx: number, cy: number) {
+  const east = (cx + 0.5) * EXPLORE.cellMeters;
+  const north = (cy + 0.5) * EXPLORE.cellMeters;
+  return {
+    latitude: EXPLORE.originLat + north / 110_574,
+    longitude: EXPLORE.originLng + east / (111_320 * Math.cos((EXPLORE.originLat * Math.PI) / 180)),
+  };
+}
+
+export async function getExplored(userId: string) {
+  const rows = await db.select({ cx: exploredCell.cx, cy: exploredCell.cy }).from(exploredCell).where(eq(exploredCell.userId, userId));
+  return {
+    originLat: EXPLORE.originLat,
+    originLng: EXPLORE.originLng,
+    cellMeters: EXPLORE.cellMeters,
+    maxCell: EXPLORE.maxCell,
+    cells: rows.map((row) => [row.cx, row.cy] as [number, number]),
+  };
+}
+
+/** Remember that the player has been through this square. Only while cloud cover is on; returns whether it was new. */
+export async function markExplored(userId: string, latitude: unknown, longitude: unknown) {
+  if (
+    typeof latitude !== 'number' || typeof longitude !== 'number' ||
+    !Number.isFinite(latitude) || !Number.isFinite(longitude) ||
+    Math.abs(latitude) > 90 || Math.abs(longitude) > 180
+  ) {
+    throw new GameError('A position is needed.', 400);
+  }
+  if (rateLimited(`explore:${userId}`, 60, 60_000)) throw new GameError('Slow down a little.', 429);
+  if (!(await getSettings()).cloudsEnabled) return { added: false };
+  const cell = exploreCellOf(latitude, longitude);
+  if (!cell) return { added: false };
+  const inserted = await db
+    .insert(exploredCell)
+    .values({ userId, cx: cell.cx, cy: cell.cy })
+    .onConflictDoNothing()
+    .returning({ cx: exploredCell.cx });
+  return { added: inserted.length > 0 };
+}
+
+/** Is there a square the player has explored whose center is within `radius` meters of this point? */
+function exploredNear(cells: Set<string>, latitude: number, longitude: number, radius: number) {
+  const home = exploreCellOf(latitude, longitude);
+  if (!home || cells.size === 0) return false;
+  const span = Math.ceil(radius / EXPLORE.cellMeters) + 1;
+  for (let dx = -span; dx <= span; dx++) {
+    for (let dy = -span; dy <= span; dy++) {
+      if (!cells.has(`${home.cx + dx},${home.cy + dy}`)) continue;
+      const center = exploreCellCenter(home.cx + dx, home.cy + dy);
+      if (distanceMeters(center.latitude, center.longitude, latitude, longitude) <= radius) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * The spawns a player sees. With dynamic cloud cover on, a protein is only shown for real when the player is within the
+ * dissolve radius (a little past it) of it now, or has explored the ground it stands on (the fog stays cleared there). Any other protein
+ * is sent with a nudged location and no summary (hidden: true), so its real position is not in the response at all.
+ * The game's own rules still use the real position on the server.
+ */
+export async function listPlaySpawns(userId: string, here?: { latitude: number; longitude: number } | null) {
   const now = new Date();
   const rows = await db.select().from(spawn).where(activeSpawnFilter(now)).orderBy(spawn.name);
   const caught = await db.select({ spawnId: capture.spawnId }).from(capture).where(eq(capture.userId, userId));
   const caughtIds = new Set(caught.map((row) => row.spawnId));
-  const { rarityEnabled } = await getSettings();
-  return rows.map((row) => presentSpawn(row, caughtIds.has(row.id), rarityEnabled));
+  const settings = await getSettings();
+  const hide = settings.cloudsEnabled && !catchAnywhere();
+  const explored = hide ? new Set((await getExplored(userId)).cells.map(([cx, cy]) => `${cx},${cy}`)) : new Set<string>();
+  return rows.map((row) => {
+    const view = presentSpawn(row, caughtIds.has(row.id), settings.rarityEnabled);
+    if (!hide) return { ...view, hidden: false };
+    const near =
+      here != null &&
+      distanceMeters(here.latitude, here.longitude, row.latitude, row.longitude) <=
+        settings.cloudDissolveRadius * CLOUD_REVEAL_FACTOR;
+    if (near || exploredNear(explored, row.latitude, row.longitude, settings.cloudDissolveRadius)) {
+      return { ...view, hidden: false };
+    }
+    const center = cloudHintCenter(row.id, row.latitude, row.longitude, settings.cloudHintRadius);
+    return { ...view, ...center, summary: null, hidden: true };
+  });
 }
 
 export async function listAdminSpawns() {
@@ -588,6 +703,19 @@ export async function captureHeatmap() {
 
 // ---- Settings ---------------------------------------------------------------------------------
 
+/** Dynamic cloud cover numbers: the allowed range and the default for each (meters, or percent for transparency). */
+export const CLOUD_LIMITS = {
+  dissolveRadius: { min: 20, max: 1000, fallback: 120 },
+  hintRadius: { min: 50, max: 3000, fallback: 350 },
+  transparency: { min: 0, max: 90, fallback: 15 },
+} as const;
+
+function numberSetting(raw: string | undefined, limits: { min: number; max: number; fallback: number }) {
+  const value = Number(raw);
+  if (raw === undefined || !Number.isFinite(value)) return limits.fallback;
+  return Math.min(limits.max, Math.max(limits.min, Math.round(value)));
+}
+
 export async function getSettings() {
   const rows = await db.select().from(appSetting);
   const map = new Map(rows.map((row) => [row.key, row.value]));
@@ -595,6 +723,11 @@ export async function getSettings() {
     leaderboardEnabled: map.get('leaderboard_enabled') === 'true',
     // On unless an admin turned it off.
     rarityEnabled: map.get('rarity_enabled') !== 'false',
+    // Dynamic cloud cover: off unless an admin turned it on.
+    cloudsEnabled: map.get('clouds_enabled') === 'true',
+    cloudDissolveRadius: numberSetting(map.get('cloud_dissolve_radius'), CLOUD_LIMITS.dissolveRadius),
+    cloudHintRadius: numberSetting(map.get('cloud_hint_radius'), CLOUD_LIMITS.hintRadius),
+    cloudTransparency: numberSetting(map.get('cloud_transparency'), CLOUD_LIMITS.transparency),
   };
 }
 
@@ -607,9 +740,39 @@ async function saveSwitch(key: string, label: string, value: unknown) {
     .onConflictDoUpdate({ target: appSetting.key, set: { value: String(value) } });
 }
 
-export async function updateSettings(input: { leaderboardEnabled?: boolean; rarityEnabled?: boolean }) {
+async function saveNumber(
+  key: string,
+  label: string,
+  value: unknown,
+  limits: { min: number; max: number; fallback: number },
+) {
+  if (value === undefined) return;
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < limits.min || value > limits.max) {
+    throw new GameError(`${label} must be a number from ${limits.min} to ${limits.max}.`, 400);
+  }
+  const text = String(Math.round(value));
+  await db
+    .insert(appSetting)
+    .values({ key, value: text })
+    .onConflictDoUpdate({ target: appSetting.key, set: { value: text } });
+}
+
+export type SettingsInput = {
+  leaderboardEnabled?: boolean;
+  rarityEnabled?: boolean;
+  cloudsEnabled?: boolean;
+  cloudDissolveRadius?: number;
+  cloudHintRadius?: number;
+  cloudTransparency?: number;
+};
+
+export async function updateSettings(input: SettingsInput) {
   await saveSwitch('leaderboard_enabled', 'leaderboardEnabled', input.leaderboardEnabled);
   await saveSwitch('rarity_enabled', 'rarityEnabled', input.rarityEnabled);
+  await saveSwitch('clouds_enabled', 'cloudsEnabled', input.cloudsEnabled);
+  await saveNumber('cloud_dissolve_radius', 'Dissolve radius', input.cloudDissolveRadius, CLOUD_LIMITS.dissolveRadius);
+  await saveNumber('cloud_hint_radius', 'Hint radius', input.cloudHintRadius, CLOUD_LIMITS.hintRadius);
+  await saveNumber('cloud_transparency', 'Cloud transparency', input.cloudTransparency, CLOUD_LIMITS.transparency);
   return getSettings();
 }
 

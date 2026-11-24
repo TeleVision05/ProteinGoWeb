@@ -7,9 +7,10 @@ import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
+import { RangeSetting } from '@/components/range-setting';
 import { Label } from '@/components/ui/label';
 import { api, ApiError } from '@/lib/api';
-import type { AccessCode, Quiz, Rarity, Spawn, StyleName } from '@/lib/types';
+import { CLOUD_LIMITS, type AccessCode, type AppSettings, type Quiz, type Rarity, type Spawn, type StyleName } from '@/lib/types';
 import { cn, formatWhen, RARITY_LABEL, RARITY_ORDER, UCR } from '@/lib/utils';
 
 function tomorrowEvening() {
@@ -107,7 +108,14 @@ export function AdminPage() {
   const [spawnRarity, setSpawnRarity] = useState<'all' | Rarity>('all');
   const [spawnStatus, setSpawnStatus] = useState<'all' | 'active' | 'expired'>('all');
   const [modelTab, setModelTab] = useState<'library' | 'upload'>('library');
-  const [settings, setSettings] = useState({ leaderboardEnabled: false, rarityEnabled: true });
+  const [settings, setSettings] = useState<AppSettings>({
+    leaderboardEnabled: false,
+    rarityEnabled: true,
+    cloudsEnabled: false,
+    cloudDissolveRadius: 120,
+    cloudHintRadius: 350,
+    cloudTransparency: 15,
+  });
   const rarityOn = settings.rarityEnabled;
   const [showHeat, setShowHeat] = useState(false);
   const [showRings, setShowRings] = useState(true);
@@ -143,7 +151,7 @@ export function AdminPage() {
     const [nextCodes, nextSpawns, nextSettings] = await Promise.all([
       api<AccessCode[]>('/api/admin/codes'),
       api<Spawn[]>('/api/admin/spawns'),
-      api<{ leaderboardEnabled: boolean; rarityEnabled: boolean }>('/api/admin/settings').catch(() => null),
+      api<AppSettings>('/api/admin/settings').catch(() => null),
     ]);
     setCodes(nextCodes);
     setSpawns(nextSpawns);
@@ -645,6 +653,62 @@ export function AdminPage() {
               aria-label="Rarity levels on"
             />
           </label>
+          <div className="rounded-lg border">
+            <label className="flex cursor-pointer items-center justify-between gap-4 px-3 py-3">
+              <span>
+                <span className="block font-medium">Dynamic cloud cover</span>
+                <span className="block text-xs text-muted-foreground">
+                  Clouds cover the player's whole map and dissolve around them as they walk. Proteins outside the cleared
+                  circle are hidden; a large colored glow in the clouds only hints that one is nearby.
+                </span>
+              </span>
+              <input
+                type="checkbox"
+                role="switch"
+                className="size-5"
+                checked={settings.cloudsEnabled}
+                onChange={(event) => void saveSetting({ cloudsEnabled: event.target.checked })}
+                aria-label="Dynamic cloud cover on"
+              />
+            </label>
+            {settings.cloudsEnabled ? (
+              <div className="grid gap-4 border-t px-3 py-3">
+                <RangeSetting
+                  id="cloud-dissolve"
+                  label="Dissolve radius"
+                  unit="m"
+                  min={CLOUD_LIMITS.dissolveRadius.min}
+                  max={CLOUD_LIMITS.dissolveRadius.max}
+                  step={10}
+                  value={settings.cloudDissolveRadius}
+                  onCommit={(value) => void saveSetting({ cloudDissolveRadius: value })}
+                  help="How far around the player the fog is mostly gone. It is clear in the middle and thickens gradually, with no hard edge, out to about twice this. Ground they have walked through stays cleared, and proteins on it show as normal markers."
+                />
+                <RangeSetting
+                  id="cloud-hint"
+                  label="Hint radius"
+                  unit="m"
+                  min={CLOUD_LIMITS.hintRadius.min}
+                  max={CLOUD_LIMITS.hintRadius.max}
+                  step={25}
+                  value={settings.cloudHintRadius}
+                  onCommit={(value) => void saveSetting({ cloudHintRadius: value })}
+                  help="How big the colored glow is for a hidden protein (its protein color, or the plain color when rarity levels are off). Bigger means less exact. Its center is nudged off the real spot."
+                />
+                <RangeSetting
+                  id="cloud-transparency"
+                  label="Cloud transparency"
+                  unit="%"
+                  min={CLOUD_LIMITS.transparency.min}
+                  max={CLOUD_LIMITS.transparency.max}
+                  step={5}
+                  value={settings.cloudTransparency}
+                  onCommit={(value) => void saveSetting({ cloudTransparency: value })}
+                  help="Higher lets more of the map show through the clouds."
+                />
+              </div>
+            ) : null}
+          </div>
         </CardContent>
       </Card>
       <section className="grid gap-6 lg:grid-cols-2">

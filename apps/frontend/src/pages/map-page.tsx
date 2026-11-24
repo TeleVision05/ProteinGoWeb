@@ -3,6 +3,7 @@ import type { ChallengeOutcome } from '@/ar/viewer';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { HeaderNav, type NavItem } from '@/components/header-nav';
 import { CampusMap } from '@/components/campus-map';
+import { ExploredStore, type ExploredInfo } from '@/lib/explored';
 import { useSession } from '@/components/session';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -49,11 +50,36 @@ export function MapPage() {
   const arActive = ar.status === 'ar' || ar.status === 'preview';
   const viewLabel = ar.arSupported ? 'View in AR' : 'View in 3D';
 
+  // The player's latest position, for the spawn requests. With cloud cover on, the server only sends the real place
+  // of proteins near that position.
+  const hereRef = useRef<Here | null>(null);
+  hereRef.current = here;
+  const fetchedAt = useRef<Here | null>(null);
+  const cloudsOn = Boolean(me?.settings?.cloudsEnabled) && !me?.catchAnywhere;
+  const cloudDissolve = me?.settings?.cloudDissolveRadius ?? 120;
+
+  // The ground the player has walked through stays cleared of fog. It is kept on the server (so it follows them
+  // between devices), loaded once, and a new 25 m square is reported as they walk into it.
+  const explored = useMemo(() => new ExploredStore(), []);
+  useEffect(() => {
+    if (!cloudsOn) return;
+    api<ExploredInfo>('/api/explored').then((info) => explored.load(info)).catch(() => undefined);
+  }, [cloudsOn, explored]);
+  useEffect(() => {
+    if (!cloudsOn || !here || here.accuracy > 80) return;
+    const cell = explored.cellOf(here.lat, here.lng);
+    if (!cell || !explored.add(cell.cx, cell.cy)) return;
+    api('/api/explored', { method: 'POST', body: JSON.stringify({ latitude: here.lat, longitude: here.lng }) }).catch(() => undefined);
+  }, [cloudsOn, here, explored]);
+
   useEffect(() => {
     if (arActive) return;
     let stop = false;
     const load = () => {
-      api<Spawn[]>('/api/spawns')
+      const at = hereRef.current;
+      fetchedAt.current = at;
+      const query = at ? `?lat=${at.lat.toFixed(6)}&lng=${at.lng.toFixed(6)}` : '';
+      api<Spawn[]>(`/api/spawns${query}`)
         .then((rows) => {
           if (!stop) setSpawns(rows);
         })
@@ -61,11 +87,22 @@ export function MapPage() {
     };
     load();
     const timer = window.setInterval(load, 20_000);
+    loadSpawns.current = load;
     return () => {
       stop = true;
       window.clearInterval(timer);
+      loadSpawns.current = null;
     };
   }, [arActive]);
+  const loadSpawns = useRef<(() => void) | null>(null);
+
+  // Under clouds, ask again once the player has walked a good way (or the first GPS fix arrives), so the proteins
+  // that came into range show up without waiting for the next refresh.
+  useEffect(() => {
+    if (!cloudsOn || !here) return;
+    const last = fetchedAt.current;
+    if (!last || distanceMeters(last.lat, last.lng, here.lat, here.lng) > 40) loadSpawns.current?.();
+  }, [cloudsOn, here]);
 
   useEffect(() => {
     api<Progress>('/api/progress').then(setProgress).catch(() => undefined);
@@ -117,7 +154,10 @@ export function MapPage() {
     return () => navigator.geolocation.clearWatch(watch);
   }, [arActive, geoRetry]);
 
-  const selected = spawns.find((spawn) => spawn.id === selectedId) ?? null;
+  // Under clouds, only proteins the server has revealed (near the player, or on ground they have explored) count as
+  // seen: the rest are just glows in the fog.
+  const visibleSpawns = useMemo(() => (cloudsOn ? spawns.filter((spawn) => !spawn.hidden) : spawns), [spawns, cloudsOn]);
+  const selected = visibleSpawns.find((spawn) => spawn.id === selectedId) ?? null;
   const distance = useMemo(() => {
     if (!selected || !here) return null;
     return distanceMeters(here.lat, here.lng, selected.latitude, selected.longitude);
@@ -127,7 +167,7 @@ export function MapPage() {
 
   const nearby = useMemo(() => {
     if (!here) return [];
-    return spawns
+    return visibleSpawns
       .map((spawn) => {
         const meters = distanceMeters(here.lat, here.lng, spawn.latitude, spawn.longitude);
         return {
@@ -138,7 +178,7 @@ export function MapPage() {
         };
       })
       .sort((a, b) => a.meters - b.meters);
-  }, [spawns, here]);
+  }, [visibleSpawns, here]);
   const nearestWild = nearby.find((entry) => !entry.spawn.caught) ?? null;
 
   // Start downloading the model as soon as a protein is selected, so Catch / View Model can open AR instantly.
@@ -365,6 +405,17 @@ export function MapPage() {
             selectedId={selectedId}
             followUser
             flyToSelected
+            rarityColors={me?.settings?.rarityEnabled !== false}
+            explored={cloudsOn ? explored : null}
+            clouds={
+              cloudsOn
+                ? {
+                    dissolveRadius: cloudDissolve,
+                    hintRadius: me?.settings?.cloudHintRadius ?? 350,
+                    transparency: me?.settings?.cloudTransparency ?? 15,
+                  }
+                : null
+            }
             onSelect={select}
           />
         ) : (
@@ -372,7 +423,7 @@ export function MapPage() {
             <p className="text-sm text-muted-foreground">
               Add VITE_MAPBOX_TOKEN to show the campus map. Spawns are listed here until then.
             </p>
-            {spawns.map((spawn) => (
+            {visibleSpawns.map((spawn) => (
               <button
                 key={spawn.id}
                 className={cn('rounded-lg border bg-card px-3 py-2 text-left', spawn.id === selectedId && 'border-primary')}
@@ -438,7 +489,7 @@ export function MapPage() {
                   </button>
                   {showNearby ? (
                     <ul className="mt-2 grid gap-1.5">
-                      {(here ? nearby : spawns.map((spawn) => ({ spawn, meters: null, bearing: 0, inRange: false }))).map(
+                      {(here ? nearby : visibleSpawns.map((spawn) => ({ spawn, meters: null, bearing: 0, inRange: false }))).map(
                         (entry) => (
                           <li key={entry.spawn.id}>
                             <button

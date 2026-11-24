@@ -1,4 +1,4 @@
-import { doublePrecision, integer, jsonb, pgTable, text, timestamp, uniqueIndex } from 'drizzle-orm/pg-core';
+import { doublePrecision, integer, jsonb, pgTable, primaryKey, text, timestamp, uniqueIndex } from 'drizzle-orm/pg-core';
 import { user } from './auth-schema';
 
 export const accessCode = pgTable('access_code', {
@@ -74,3 +74,20 @@ export const appSetting = pgTable('app_setting', {
   key: text('key').primaryKey(),
   value: text('value').notNull(),
 });
+
+/**
+ * Dynamic cloud cover: the map squares (25 m) a player has walked through, so the fog stays cleared there. Only a
+ * coarse grid cell is kept, never an exact position, and only while cloud cover is switched on.
+ */
+export const exploredCell = pgTable(
+  'explored_cell',
+  {
+    userId: text('user_id')
+      .notNull()
+      .references(() => user.id, { onDelete: 'cascade' }),
+    cx: integer('cx').notNull(),
+    cy: integer('cy').notNull(),
+    seenAt: timestamp('seen_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [primaryKey({ columns: [table.userId, table.cx, table.cy] })],
+);

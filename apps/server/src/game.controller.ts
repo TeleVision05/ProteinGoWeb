@@ -23,6 +23,7 @@ import {
   deleteSpawn,
   getAccess,
   getChallenge,
+  getExplored,
   getCollection,
   getLeaderboard,
   getProgress,
@@ -31,6 +32,7 @@ import {
   listAdminSpawns,
   listCodes,
   listPlaySpawns,
+  markExplored,
   readSpawnModel,
   redeemCode,
   revokeCode,
@@ -39,6 +41,7 @@ import {
   updateSpawn,
   type ModelFiles,
   type ModelUpload,
+  type SettingsInput,
   type Style,
 } from './game';
 import { devAccountList, devBypassEnabled, devCookie, devUser, isDevRole } from './dev-auth';
@@ -172,8 +175,15 @@ export class GameController {
 
   @Patch('admin/settings')
   @UseGuards(AuthGuard, AdminGuard)
-  saveSettings(@Body() body: { leaderboardEnabled?: boolean; rarityEnabled?: boolean }) {
-    return updateSettings({ leaderboardEnabled: body?.leaderboardEnabled, rarityEnabled: body?.rarityEnabled });
+  saveSettings(@Body() body: SettingsInput) {
+    return updateSettings({
+      leaderboardEnabled: body?.leaderboardEnabled,
+      rarityEnabled: body?.rarityEnabled,
+      cloudsEnabled: body?.cloudsEnabled,
+      cloudDissolveRadius: body?.cloudDissolveRadius,
+      cloudHintRadius: body?.cloudHintRadius,
+      cloudTransparency: body?.cloudTransparency,
+    });
   }
 
   @Post('codes/redeem')
@@ -207,8 +217,25 @@ export class GameController {
 
   @Get('spawns')
   @UseGuards(AuthGuard, PlayGuard)
-  spawns(@Req() request: AuthedRequest) {
-    return listPlaySpawns(request.user.id);
+  spawns(@Req() request: AuthedRequest, @Query('lat') lat?: string, @Query('lng') lng?: string) {
+    // The player's position (optional): with cloud cover on, only proteins near it come back with their real place.
+    const latitude = lat === undefined || lat === '' ? NaN : Number(lat);
+    const longitude = lng === undefined || lng === '' ? NaN : Number(lng);
+    const valid = Number.isFinite(latitude) && Number.isFinite(longitude) && Math.abs(latitude) <= 90 && Math.abs(longitude) <= 180;
+    return listPlaySpawns(request.user.id, valid ? { latitude, longitude } : null);
+  }
+
+  /** The map squares this player has walked through (cloud cover keeps them cleared). */
+  @Get('explored')
+  @UseGuards(AuthGuard, PlayGuard)
+  explored(@Req() request: AuthedRequest) {
+    return getExplored(request.user.id);
+  }
+
+  @Post('explored')
+  @UseGuards(AuthGuard, PlayGuard)
+  markExplored(@Req() request: AuthedRequest, @Body() body: { latitude?: number; longitude?: number }) {
+    return markExplored(request.user.id, body?.latitude, body?.longitude);
   }
 
   @Post('spawns/:id/catch')

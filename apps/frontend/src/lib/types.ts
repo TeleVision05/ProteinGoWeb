@@ -1,10 +1,27 @@
+/** Settings an admin controls. The cloud numbers are meters, except transparency (percent). */
+export type AppSettings = {
+  leaderboardEnabled: boolean;
+  rarityEnabled: boolean;
+  cloudsEnabled: boolean;
+  cloudDissolveRadius: number;
+  cloudHintRadius: number;
+  cloudTransparency: number;
+};
+
+/** Allowed ranges for the cloud numbers (the server checks the same ones). */
+export const CLOUD_LIMITS = {
+  dissolveRadius: { min: 20, max: 1000 },
+  hintRadius: { min: 50, max: 3000 },
+  transparency: { min: 0, max: 90 },
+} as const;
+
 export type Me = {
   user: { id: string; name: string; email: string; image: string | null };
   isAdmin: boolean;
   access: { active: boolean; expiresAt: string | null; label: string | null };
   /** Test switch: catching needs no location. */
   catchAnywhere?: boolean;
-  settings?: { leaderboardEnabled: boolean; rarityEnabled: boolean };
+  settings?: AppSettings;
 };
 
 export type Rarity = 'common' | 'uncommon' | 'rare' | 'legendary';
@@ -83,6 +100,8 @@ export type Spawn = {
   styles: ModelStyle[];
   catchCount?: number;
   quiz?: Quiz | null;
+  /** Under the cloud cover: latitude and longitude are only a rough hint, not the real spot. Never shown as a marker. */
+  hidden?: boolean;
 };
 
 export type AccessCode = {
