@@ -78,7 +78,64 @@ export type CatchResult = {
   bonus: number;
   leveledUp: boolean;
   progress: Progress;
+  /** Assignments this catch just finished. */
+  completed?: { id: string; title: string; code: string }[];
 };
+
+/** What a student sees for an assignment: progress and, once every protein is caught, the code to hand in. */
+export type MyAssignment = {
+  id: string;
+  title: string;
+  dueAt: string | null;
+  total: number;
+  caught: number;
+  done: boolean;
+  completedAt: string | null;
+  late: boolean;
+  code: string | null;
+  proteins: { id: string; name: string; caught: boolean; caughtAt: string | null }[];
+};
+
+export type AdminAssignment = {
+  id: string;
+  title: string;
+  dueAt: string | null;
+  createdAt: string;
+  spawns: { id: string; name: string }[];
+};
+
+export type RosterStudent = {
+  userId: string;
+  name: string;
+  email: string;
+  sections: string[];
+  caught: number;
+  xp: number;
+  firstTry: number;
+  wrongAnswers: number;
+  lastCatch: string | null;
+  assignment: {
+    caught: number;
+    total: number;
+    done: boolean;
+    completedAt: string | null;
+    late: boolean;
+    code: string | null;
+  } | null;
+};
+
+export type RosterQuestion = {
+  spawnId: string;
+  name: string;
+  question: string;
+  students: number;
+  caught: number;
+  firstTryPercent: number | null;
+  wrongAnswers: number;
+  topWrong: { answer: string; count: number } | null;
+};
+
+export type Roster = { assignment: AdminAssignment | null; students: RosterStudent[]; questions: RosterQuestion[] };
 
 export type Spawn = {
   id: string;

@@ -2,18 +2,18 @@ import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
+import { toast } from '@/lib/toast';
 import { api, ApiError } from '@/lib/api';
 import type { Leaderboard } from '@/lib/types';
 import { cn } from '@/lib/utils';
 
 export function LeaderboardPage() {
   const [board, setBoard] = useState<Leaderboard | null>(null);
-  const [error, setError] = useState('');
 
   useEffect(() => {
     api<Leaderboard>('/api/leaderboard')
       .then(setBoard)
-      .catch((caught) => setError(caught instanceof ApiError ? caught.message : 'Could not load the leaderboard.'));
+      .catch((caught) => toast.error(caught instanceof ApiError ? caught.message : 'Could not load the leaderboard.'));
   }, []);
 
   return (
@@ -29,7 +29,6 @@ export function LeaderboardPage() {
           </Button>
         </div>
       </header>
-      {error ? <p className="text-sm text-destructive">{error}</p> : null}
       {board && !board.enabled ? <p className="text-sm text-muted-foreground">Leaderboard is off.</p> : null}
       {board?.enabled ? (
         <Card>

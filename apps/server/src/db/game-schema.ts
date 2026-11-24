@@ -1,4 +1,4 @@
-import { doublePrecision, integer, jsonb, pgTable, primaryKey, text, timestamp, uniqueIndex } from 'drizzle-orm/pg-core';
+import { boolean, doublePrecision, index, integer, jsonb, pgTable, primaryKey, text, timestamp, uniqueIndex } from 'drizzle-orm/pg-core';
 import { user } from './auth-schema';
 
 export const accessCode = pgTable('access_code', {
@@ -67,6 +67,52 @@ export const capture = pgTable(
     caughtAt: timestamp('caught_at', { withTimezone: true }).defaultNow().notNull(),
   },
   (table) => [uniqueIndex('capture_once').on(table.spawnId, table.userId)],
+);
+
+/**
+ * Every answer a student gives to a quiz question, right or wrong. It keeps the retry cool-down across server
+ * restarts and tells the teacher which questions are hard and which wrong answers are popular.
+ */
+export const quizAttempt = pgTable(
+  'quiz_attempt',
+  {
+    id: text('id').primaryKey(),
+    spawnId: text('spawn_id')
+      .notNull()
+      .references(() => spawn.id, { onDelete: 'cascade' }),
+    userId: text('user_id')
+      .notNull()
+      .references(() => user.id, { onDelete: 'cascade' }),
+    answerIndex: integer('answer_index').notNull(),
+    correct: boolean('correct').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [index('quiz_attempt_user_spawn').on(table.userId, table.spawnId)],
+);
+
+/**
+ * A class assignment: catch every protein in the set. Students who do get a completion code to hand in; the due
+ * date only marks a catch as late for the teacher, it never blocks play (the assignment is low stakes).
+ */
+export const assignment = pgTable('assignment', {
+  id: text('id').primaryKey(),
+  title: text('title').notNull(),
+  dueAt: timestamp('due_at', { withTimezone: true }),
+  createdBy: text('created_by').references(() => user.id, { onDelete: 'set null' }),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
+export const assignmentSpawn = pgTable(
+  'assignment_spawn',
+  {
+    assignmentId: text('assignment_id')
+      .notNull()
+      .references(() => assignment.id, { onDelete: 'cascade' }),
+    spawnId: text('spawn_id')
+      .notNull()
+      .references(() => spawn.id, { onDelete: 'cascade' }),
+  },
+  (table) => [primaryKey({ columns: [table.assignmentId, table.spawnId] })],
 );
 
 /** Small key/value switches the admin can flip, e.g. leaderboard_enabled. */

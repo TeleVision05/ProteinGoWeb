@@ -13,6 +13,7 @@ import {
 } from '@nestjs/common';
 import type { FastifyReply, FastifyRequest } from 'fastify';
 import { AdminGuard, AuthGuard, AuthedRequest, PlayGuard } from './auth.guard';
+import { createAssignment, deleteAssignment, getRoster, listAdminAssignments, listMyAssignments, newlyCompleted, rosterCsv } from './assignments';
 import {
   GameError,
   catchAnywhere,
@@ -240,14 +241,14 @@ export class GameController {
 
   @Post('spawns/:id/catch')
   @UseGuards(AuthGuard, PlayGuard)
-  catch(
+  async catch(
     @Req() request: AuthedRequest,
     @Param('id') id: string,
     @Body() body: { latitude?: number; longitude?: number; accuracy?: number; answer?: number },
   ) {
     // With CATCH_ANYWHERE the location is optional (the app may not send one).
     const anywhere = catchAnywhere();
-    return catchSpawn({
+    const result = await catchSpawn({
       userId: request.user.id,
       spawnId: id,
       latitude: anywhere && body.latitude == null ? undefined : requiredNumber(body.latitude, 'Latitude'),
@@ -255,6 +256,57 @@ export class GameController {
       accuracy: body.accuracy == null ? undefined : requiredNumber(body.accuracy, 'Accuracy'),
       answer: body.answer == null ? undefined : requiredNumber(body.answer, 'Answer'),
     });
+    // Tell the app when this catch finished an assignment, so it can point the student to their completion code.
+    const completed = result.already ? [] : await newlyCompleted(request.user.id, id);
+    return { ...result, completed };
+  }
+
+  @Get('assignments')
+  @UseGuards(AuthGuard, PlayGuard)
+  myAssignments(@Req() request: AuthedRequest) {
+    return listMyAssignments(request.user.id);
+  }
+
+  @Get('admin/assignments')
+  @UseGuards(AuthGuard, AdminGuard)
+  adminAssignments() {
+    return listAdminAssignments();
+  }
+
+  @Post('admin/assignments')
+  @UseGuards(AuthGuard, AdminGuard)
+  addAssignment(
+    @Req() request: AuthedRequest,
+    @Body() body: { title?: string; dueAt?: string | null; spawnIds?: unknown },
+  ) {
+    return createAssignment({
+      title: body?.title ?? '',
+      dueAt: body?.dueAt ? parseDate(body.dueAt, 'Due date') : null,
+      spawnIds: Array.isArray(body?.spawnIds) ? body.spawnIds.filter((id): id is string => typeof id === 'string') : [],
+      createdBy: request.user.id,
+    });
+  }
+
+  @Delete('admin/assignments/:id')
+  @UseGuards(AuthGuard, AdminGuard)
+  removeAssignment(@Param('id') id: string) {
+    return deleteAssignment(id);
+  }
+
+  @Get('admin/roster')
+  @UseGuards(AuthGuard, AdminGuard)
+  roster(@Query('assignmentId') assignmentId?: string) {
+    return getRoster(assignmentId || null);
+  }
+
+  @Get('admin/roster.csv')
+  @UseGuards(AuthGuard, AdminGuard)
+  async rosterFile(@Query('assignmentId') assignmentId: string | undefined, @Res() reply: FastifyReply) {
+    const file = await rosterCsv(assignmentId || null);
+    reply.header('content-type', 'text/csv; charset=utf-8');
+    reply.header('content-disposition', `attachment; filename="${file.filename}"`);
+    reply.header('cache-control', 'no-store');
+    reply.send(file.body);
   }
 
   @Get('spawns/:id/challenge')

@@ -10,6 +10,7 @@ import { Button } from '@/components/ui/button';
 import { XpBar } from '@/components/xp-bar';
 import { api, ApiError } from '@/lib/api';
 import { signOutEverywhere } from '@/lib/auth-client';
+import { toast } from '@/lib/toast';
 import type { CatchResult, Progress, Spawn } from '@/lib/types';
 import {
   bearingDegrees,
@@ -24,7 +25,7 @@ import {
 
 type Here = { lat: number; lng: number; accuracy: number };
 type GeoState = 'unknown' | 'granted' | 'prompt' | 'denied' | 'unsupported';
-type QuizState = { spawn: Spawn; question: string; options: string[]; message: string; busy: boolean };
+type QuizState = { spawn: Spawn; question: string; options: string[]; busy: boolean };
 
 const GPS_TOLERANCE = 25;
 const POOR_ACCURACY = 50;
@@ -37,7 +38,6 @@ export function MapPage() {
   const [geoState, setGeoState] = useState<GeoState>('unknown');
   const [geoError, setGeoError] = useState('');
   const [geoRetry, setGeoRetry] = useState(0);
-  const [actionError, setActionError] = useState('');
   const [pending, setPending] = useState(false);
   const [quiz, setQuiz] = useState<QuizState | null>(null);
   const [reward, setReward] = useState<{ spawn: Spawn; result: CatchResult } | null>(null);
@@ -83,9 +83,16 @@ export function MapPage() {
       const query = at ? `?lat=${at.lat.toFixed(6)}&lng=${at.lng.toFixed(6)}` : '';
       api<Spawn[]>(`/api/spawns${query}`)
         .then((rows) => {
-          if (!stop) setSpawns(rows);
+          if (stop) return;
+          setSpawns(rows);
+          spawnsFailing.current = false;
         })
-        .catch(() => undefined);
+        .catch((error: unknown) => {
+          // Refreshes run every 20 s: say so once when they start failing, not on every retry.
+          if (stop || spawnsFailing.current) return;
+          spawnsFailing.current = true;
+          toast.error(error instanceof ApiError ? error.message : 'Could not load the proteins. Check your connection.');
+        });
     };
     load();
     const timer = window.setInterval(load, 20_000);
@@ -97,6 +104,7 @@ export function MapPage() {
     };
   }, [arActive]);
   const loadSpawns = useRef<(() => void) | null>(null);
+  const spawnsFailing = useRef(false);
 
   // Under clouds, ask again once the player has walked a good way (or the first GPS fix arrives), so the proteins
   // that came into range show up without waiting for the next refresh.
@@ -210,6 +218,20 @@ export function MapPage() {
     };
   }, [selectedQuizId]);
 
+  // AR problems (could not start, model failed) arrive as one message from the AR provider.
+  const arError = ar.error;
+  useEffect(() => {
+    if (arError) toast.error(arError);
+  }, [arError]);
+
+  useEffect(() => {
+    if (geoError && geoError !== 'Location is blocked.') toast.error(geoError);
+  }, [geoError]);
+
+  useEffect(() => {
+    if (geoState === 'denied') toast.error('Location is blocked. Catching needs your location.');
+  }, [geoState]);
+
   const modelReady = selected != null && ar.preparedId === selected.id && ar.status !== 'loading' && ar.status !== 'idle';
   const modelLoading = selected != null && ar.preparedId === selected.id && ar.status === 'loading';
   const loadingLabel = ar.progress >= 0 ? `Loading model ${Math.round(ar.progress * 100)}%` : 'Loading model…';
@@ -222,7 +244,6 @@ export function MapPage() {
 
   const select = useCallback((id: string) => {
     setSelectedId(id);
-    setActionError('');
     setReward(null);
     setShowNearby(false);
   }, []);
@@ -243,6 +264,10 @@ export function MapPage() {
     setSpawns((current) => current.map((item) => (item.id === spawn.id ? { ...item, caught: true } : item)));
     setProgress(result.progress);
     if (!result.already) setReward({ spawn, result });
+    // This catch may have finished an assignment: the code is on the Assignments page.
+    for (const done of result.completed ?? []) {
+      toast.success(`Assignment "${done.title}" complete! Your code is on the Assignments page.`);
+    }
   }
 
   function catchBody(extra: { answer?: number } = {}) {
@@ -258,7 +283,6 @@ export function MapPage() {
   function catchSelected() {
     if (!selected || (!here && !me?.catchAnywhere)) return;
     const spawn = selected;
-    setActionError('');
     setReward(null);
     if (ar.launchRequired && spawn.hasModel) {
       // iPhone Safari: one tap goes straight to the App Clip, where the question and the catch happen.
@@ -277,8 +301,8 @@ export function MapPage() {
       // No model to show it on: ask on the map instead.
       setPending(true);
       api<{ question: string; options: string[] }>(`/api/spawns/${spawn.id}/challenge`)
-        .then((challenge) => setQuiz({ spawn, question: challenge.question, options: challenge.options, message: '', busy: false }))
-        .catch((error: unknown) => setActionError(error instanceof ApiError ? error.message : 'Could not load the question.'))
+        .then((challenge) => setQuiz({ spawn, question: challenge.question, options: challenge.options, busy: false }))
+        .catch((error: unknown) => toast.error(error instanceof ApiError ? error.message : 'Could not load the question.'))
         .finally(() => setPending(false));
       return;
     }
@@ -290,7 +314,7 @@ export function MapPage() {
       .then((result) => applyCaught(spawn, result))
       .catch((error: unknown) => {
         if (opensAr) ar.exit();
-        setActionError(error instanceof ApiError ? error.message : 'Catch failed.');
+        toast.error(error instanceof ApiError ? error.message : 'Catch failed.');
       })
       .finally(() => setPending(false));
   }
@@ -318,7 +342,7 @@ export function MapPage() {
   function answer(index: number) {
     if (!quiz || quiz.busy) return;
     const { spawn } = quiz;
-    setQuiz({ ...quiz, busy: true, message: '' });
+    setQuiz({ ...quiz, busy: true });
     api<CatchResult>(`/api/spawns/${spawn.id}/catch`, { method: 'POST', body: catchBody({ answer: index }) })
       .then((result) => {
         setQuiz(null);
@@ -328,11 +352,11 @@ export function MapPage() {
       .catch((error: unknown) => {
         const message = error instanceof ApiError ? error.message : 'Catch failed.';
         if (error instanceof ApiError && (error.status === 422 || error.status === 429)) {
-          setQuiz((current) => (current ? { ...current, busy: false, message } : current));
+          setQuiz((current) => (current ? { ...current, busy: false } : current));
         } else {
           setQuiz(null);
-          setActionError(message);
         }
+        toast.error(message);
       });
   }
 
@@ -343,6 +367,7 @@ export function MapPage() {
 
   const navItems: NavItem[] = [
     { to: '/collection', label: 'Collection' },
+    { to: '/assignments', label: 'Assignments' },
     ...(me?.settings?.leaderboardEnabled ? [{ to: '/leaderboard', label: 'Leaderboard' }] : []),
     ...(me?.isAdmin ? [{ to: '/admin', label: 'Admin' }] : []),
   ];
@@ -363,10 +388,9 @@ export function MapPage() {
       <p className="text-sm text-muted-foreground">This browser cannot share your location, so you cannot catch here.</p>
     ) : !here ? (
       <p className="text-xs text-muted-foreground">
-        {geoError ||
-          (geoState === 'prompt'
-            ? 'Allow location when your browser asks. It is only used to check you are near a protein.'
-            : 'Finding you…')}
+        {geoState === 'prompt'
+          ? 'Allow location when your browser asks. It is only used to check you are near a protein.'
+          : 'Finding you…'}
         {geoError ? (
           <button className="ml-2 underline" onClick={() => setGeoRetry((count) => count + 1)}>
             Retry
@@ -554,8 +578,6 @@ export function MapPage() {
               {!selected.hasModel ? (
                 <p className="text-xs text-muted-foreground">No model attached. Add one in /admin.</p>
               ) : null}
-              {ar.error ? <p className="text-sm text-destructive">{ar.error}</p> : null}
-              {actionError ? <p className="text-sm text-destructive">{actionError}</p> : null}
               {reward && reward.spawn.id === selected.id ? <RewardCard reward={reward} onClose={dismissReward} /> : null}
               <div className="flex gap-2">
                 {selected.caught ? (
@@ -598,7 +620,6 @@ export function MapPage() {
                   </Button>
                 ))}
               </div>
-              {quiz.message ? <p className="mt-3 text-sm text-destructive">{quiz.message}</p> : null}
               <Button className="mt-4" variant="ghost" onClick={() => setQuiz(null)}>
                 Cancel
               </Button>

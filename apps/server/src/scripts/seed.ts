@@ -10,13 +10,15 @@ import path from 'node:path';
 import { eq, inArray } from 'drizzle-orm';
 import { user } from '../db/auth-schema';
 import { db, pool } from '../db/db';
-import { accessCode, capture, spawn } from '../db/game-schema';
+import { accessCode, assignment, capture, codeRedemption, quizAttempt, spawn } from '../db/game-schema';
+import { createAssignment } from '../assignments';
 import { devUser } from '../dev-auth';
 import { createSpawn, deleteSpawn, updateSettings, type ModelFiles, type ModelUpload } from '../game';
 import { rewardFor } from '../progress';
 
 const SEED_USER = 'seed-bot';
 const DEMO_CODE = 'DEMO2026';
+const DEMO_ASSIGNMENT = 'Lab 1: Muscle and blood proteins';
 const MODELS_DIR = path.resolve(process.cwd(), '../frontend/public/ar/models');
 
 type Rarity = 'common' | 'uncommon' | 'rare' | 'legendary';
@@ -145,8 +147,9 @@ async function main() {
   const old = await db.select({ id: spawn.id }).from(spawn).where(eq(spawn.createdBy, SEED_USER));
   for (const row of old) await deleteSpawn(row.id);
   await db.delete(accessCode).where(eq(accessCode.code, DEMO_CODE));
+  const demoCodeId = crypto.randomUUID();
   await db.insert(accessCode).values({
-    id: crypto.randomUUID(),
+    id: demoCodeId,
     code: DEMO_CODE,
     label: 'Demo class',
     expiresAt: new Date(Date.now() + 90 * 86_400_000),
@@ -190,6 +193,8 @@ async function main() {
       })
       .onConflictDoNothing();
     await db.delete(capture).where(eq(capture.userId, player.id));
+    await db.delete(quizAttempt).where(eq(quizAttempt.userId, player.id));
+    await db.insert(codeRedemption).values({ id: crypto.randomUUID(), codeId: demoCodeId, userId: player.id }).onConflictDoNothing();
     const rows = created.slice(0, Math.min(player.catches, created.length));
     if (!rows.length) continue;
     const [first] = await db.select().from(spawn).where(inArray(spawn.id, rows.map((r) => r.id)));
@@ -201,11 +206,40 @@ async function main() {
         latitude: first?.latitude ?? 33.9737,
         longitude: first?.longitude ?? -117.3281,
         xp: rewardFor(row.rarity, false).xp,
-        attempts: 1,
+        // Sam needed a second try on the first question, so the roster has a wrong answer to show.
+        attempts: player.id === 'seed-player-3' && index === 0 && PLANS[index]?.quiz ? 2 : 1,
         caughtAt: new Date(Date.now() - index * 3_600_000),
       })),
     );
+    // The answers behind those catches, so the teacher's question table has numbers.
+    for (const [index] of rows.entries()) {
+      const quiz = PLANS[index]?.quiz;
+      if (!quiz) continue;
+      const answers: { answerIndex: number; correct: boolean }[] = [];
+      if (player.id === 'seed-player-3' && index === 0) {
+        answers.push({ answerIndex: (quiz.answerIndex + 1) % quiz.options.length, correct: false });
+      }
+      answers.push({ answerIndex: quiz.answerIndex, correct: true });
+      await db.insert(quizAttempt).values(
+        answers.map((answer, order) => ({
+          id: crypto.randomUUID(),
+          spawnId: rows[index].id,
+          userId: player.id,
+          ...answer,
+          createdAt: new Date(Date.now() - index * 3_600_000 - (answers.length - order) * 60_000),
+        })),
+      );
+    }
   }
+
+  // A demo assignment over the first three proteins; Maya has finished it, the others are part way.
+  await db.delete(assignment).where(eq(assignment.title, DEMO_ASSIGNMENT));
+  await createAssignment({
+    title: DEMO_ASSIGNMENT,
+    dueAt: new Date(Date.now() + 7 * 86_400_000),
+    spawnIds: created.slice(0, 3).map((item) => item.id),
+    createdBy: admin.id,
+  });
 
   await updateSettings({ leaderboardEnabled: true });
   console.log(`\nSeeded ${created.length} proteins, ${PLAYERS.length} players, code ${DEMO_CODE}. Leaderboard is on.`);

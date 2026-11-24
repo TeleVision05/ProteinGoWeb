@@ -2,7 +2,7 @@ import { createHmac } from 'node:crypto';
 import { and, desc, eq, gt, inArray, isNull, or, sql } from 'drizzle-orm';
 import { db } from './db/db';
 import { user } from './db/auth-schema';
-import { accessCode, appSetting, capture, codeRedemption, exploredCell, spawn, type ModelVariant } from './db/game-schema';
+import { accessCode, appSetting, capture, codeRedemption, exploredCell, quizAttempt, spawn, type ModelVariant } from './db/game-schema';
 import { buildAchievements, isRarity, levelFor, publicName, rewardFor, streaks, RARITIES, type ProgressStats, type Rarity } from './progress';
 import { rateLimited } from './rate-limit';
 import { deleteModel, putModel, readBundledModel, readModel } from './storage';
@@ -900,8 +900,6 @@ export function catchAnywhere() {
   return process.env.CATCH_ANYWHERE === 'true';
 }
 
-const wrongAnswers = new Map<string, { count: number; at: number }>();
-
 /** The question for a spawn, without the answer. */
 export async function getChallenge(spawnId: string) {
   const [row] = await db
@@ -973,18 +971,32 @@ export async function catchSpawn(input: {
 
   let attempts = 1;
   if (row.quiz) {
-    if (!Number.isInteger(input.answer)) throw new GameError('Answer the question to catch this protein.', 400);
-    const key = `${input.userId}:${row.id}`;
-    const wrong = wrongAnswers.get(key);
-    if (wrong && now.getTime() - wrong.at < WRONG_ANSWER_COOLDOWN_MS) {
+    if (!Number.isInteger(input.answer) || (input.answer as number) < 0 || (input.answer as number) >= row.quiz.options.length) throw new GameError('Answer the question to catch this protein.', 400);
+    const mine = and(eq(quizAttempt.userId, input.userId), eq(quizAttempt.spawnId, row.id));
+    const [lastWrong] = await db
+      .select({ createdAt: quizAttempt.createdAt })
+      .from(quizAttempt)
+      .where(and(mine, eq(quizAttempt.correct, false)))
+      .orderBy(desc(quizAttempt.createdAt))
+      .limit(1);
+    if (lastWrong && now.getTime() - lastWrong.createdAt.getTime() < WRONG_ANSWER_COOLDOWN_MS) {
       throw new GameError('Take a moment, then try again.', 429);
     }
-    if (input.answer !== row.quiz.answerIndex) {
-      wrongAnswers.set(key, { count: (wrong?.count ?? 0) + 1, at: now.getTime() });
-      throw new GameError('Not quite. Give it another go.', 422);
-    }
-    attempts = (wrong?.count ?? 0) + 1;
-    wrongAnswers.delete(key);
+    const correct = input.answer === row.quiz.answerIndex;
+    await db.insert(quizAttempt).values({
+      id: crypto.randomUUID(),
+      spawnId: row.id,
+      userId: input.userId,
+      answerIndex: input.answer as number,
+      correct,
+      createdAt: now,
+    });
+    if (!correct) throw new GameError('Not quite. Give it another go.', 422);
+    const [{ wrong }] = await db
+      .select({ wrong: sql<number>`cast(count(*) as int)` })
+      .from(quizAttempt)
+      .where(and(mine, eq(quizAttempt.correct, false)));
+    attempts = Number(wrong) + 1;
   }
 
   const { rarityEnabled } = await getSettings();
