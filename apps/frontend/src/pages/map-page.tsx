@@ -55,7 +55,9 @@ export function MapPage() {
   const hereRef = useRef<Here | null>(null);
   hereRef.current = here;
   const fetchedAt = useRef<Here | null>(null);
-  const cloudsOn = Boolean(me?.settings?.cloudsEnabled) && !me?.catchAnywhere;
+  // In the CATCH_ANYWHERE test mode the server hides nothing, so the fog is only for show there: proteins stay
+  // visible and catchable, and there are no glows (nothing is hidden).
+  const cloudsOn = Boolean(me?.settings?.cloudsEnabled);
   const cloudDissolve = me?.settings?.cloudDissolveRadius ?? 120;
 
   // The ground the player has walked through stays cleared of fog. It is kept on the server (so it follows them

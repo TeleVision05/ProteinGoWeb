@@ -117,6 +117,8 @@ export function CampusMap({
     [clouds, spawns, rarityColors],
   );
 
+  // Markers and the player's dot sit above the fog layer (which is z-index 1), so a protein can always be seen and tapped.
+  const lift = clouds ? 2 : 0;
   const center = user ?? UCR;
   return (
     <div className={className} style={{ position: 'relative' }}>
@@ -156,7 +158,7 @@ export function CampusMap({
             />
           </Source>
         ) : null}
-        {user ? <Dot lat={user.lat} lng={user.lng} color="#f4f7fb" size={16} title="You" z={2} /> : null}
+        {user ? <Dot lat={user.lat} lng={user.lng} color="#f4f7fb" size={16} title="You" z={2 + lift} /> : null}
         {draft ? <Dot lat={draft.lat} lng={draft.lng} color="#ffffff" size={14} title="New spawn" /> : null}
         {markers.map((spawn) => (
           <Dot
@@ -164,7 +166,7 @@ export function CampusMap({
             lat={spawn.latitude}
             lng={spawn.longitude}
             title={spawn.name}
-            z={selectedId === spawn.id ? 3 : 1}
+            z={(selectedId === spawn.id ? 3 : 1) + lift}
             color={colorOf(spawn)}
             faded={spawn.caught}
             selected={selectedId === spawn.id}
