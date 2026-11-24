@@ -5,6 +5,7 @@ import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { XpBar } from '@/components/xp-bar';
+import { toast } from '@/lib/toast';
 import { api, ApiError } from '@/lib/api';
 import type { CollectionItem, Progress } from '@/lib/types';
 import { cn, formatWhen, RARITY_COLOR, RARITY_LABEL, RARITY_ORDER } from '@/lib/utils';
@@ -24,7 +25,6 @@ export function CollectionPage() {
   const [progress, setProgress] = useState<Progress | null>(null);
   const [filter, setFilter] = useState<'all' | (typeof RARITY_ORDER)[number]>('all');
   const [showOnly, setShowOnly] = useState<'all' | 'caught' | 'missing'>('all');
-  const [error, setError] = useState('');
   const [loaded, setLoaded] = useState(false);
 
   useEffect(() => {
@@ -33,7 +33,7 @@ export function CollectionPage() {
         setItems(data.items);
         setProgress(data.progress);
       })
-      .catch((caught) => setError(caught instanceof ApiError ? caught.message : 'Could not load your collection.'))
+      .catch((caught) => toast.error(caught instanceof ApiError ? caught.message : 'Could not load your collection.'))
       .finally(() => setLoaded(true));
   }, []);
 
@@ -68,7 +68,6 @@ export function CollectionPage() {
           </Button>
         </div>
       </header>
-      {error ? <p className="text-sm text-destructive">{error}</p> : null}
 
       {progress ? (
         <Card>

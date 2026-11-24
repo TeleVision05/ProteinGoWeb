@@ -6,12 +6,12 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { redeem, useSession } from '@/components/session';
 import { ApiError } from '@/lib/api';
+import { toast } from '@/lib/toast';
 import { signOutEverywhere } from '@/lib/auth-client';
 
 export function RedeemPage() {
   const { me, refresh } = useSession();
   const [code, setCode] = useState('');
-  const [error, setError] = useState('');
   const [pending, setPending] = useState(false);
 
   if (me?.access.active) return <Navigate to="/" replace />;
@@ -19,12 +19,11 @@ export function RedeemPage() {
   async function onSubmit(event: FormEvent) {
     event.preventDefault();
     setPending(true);
-    setError('');
     try {
       await redeem(code);
       await refresh();
     } catch (caught) {
-      setError(caught instanceof ApiError ? caught.message : 'Could not redeem that code.');
+      toast.error(caught instanceof ApiError ? caught.message : 'Could not redeem that code.');
     } finally {
       setPending(false);
     }
@@ -52,7 +51,6 @@ export function RedeemPage() {
                 placeholder="LAB-4F2K"
               />
             </div>
-            {error ? <p className="text-sm text-destructive">{error}</p> : null}
             <Button type="submit" disabled={pending || code.trim().length < 4}>
               Unlock the map
             </Button>

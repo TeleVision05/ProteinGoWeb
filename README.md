@@ -14,17 +14,27 @@ streaks and achievements, and fill a personal collection.
   with the controls: a ribbon/spheres switch for proteins that have both, and animation play, restart, speed and scrub.
   Models switch level of detail (LOD) by distance.
 - Collection page, XP bar, levels, daily streaks, 10 achievements, and an optional leaderboard.
+- **Assignments** page: the proteins the instructor requires, progress through them, and, once every one is caught, a
+  personal completion code to hand in (plus a note if it was after the due date).
 
 **Admins** (`/admin`)
 - Add, edit, move and delete proteins; pick models from the library or upload your own (sphere/ribbon, each with
   an optional low-detail LOD).
 - Quiz question, rarity and catch radius per protein; scatter many proteins across an area at once.
 - Map layers (catch heatmap, coverage), filters, class access codes.
+- **Assignments**: pick the required proteins and an optional due date. The due date only marks a finish as late; it
+  never blocks play.
+- **Roster**: every student with proteins caught, XP, first-try and wrong quiz answers, and per assignment whether they
+  are done, when, and their completion code (so a handed-in code can be checked). Download it as CSV. A question table
+  lists the questions with the most wrong answers and the most common wrong answer.
 - Settings: turn the leaderboard and rarity levels on or off, and **Dynamic cloud cover**: clouds cover the players' whole
   map and dissolve in a soft-edged circle around them as they walk, and the ground they have walked through stays cleared
   (kept on the server as 25 m squares, only while cloud cover is on). Proteins outside the cleared ground are hidden (the
   server only sends their real place when a player is near or has explored there), and a large, gradual glow in the
   protein's color shows roughly where one is. Dissolve radius, hint radius and cloud transparency are adjustable.
+
+**Quiz answers** are stored (right and wrong), which keeps the retry cool-down across server restarts and feeds the
+roster's question table.
 
 **Anti-cheat**: catch rate limit, GPS accuracy limit, impossible-travel check, and a cooldown after a wrong answer.
 

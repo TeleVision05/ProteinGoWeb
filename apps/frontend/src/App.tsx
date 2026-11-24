@@ -1,7 +1,9 @@
 import { BrowserRouter, Route, Routes } from 'react-router-dom';
 import { ArProvider } from '@/components/ar-provider';
+import { Toaster } from '@/components/toaster';
 import { RequireAdmin, RequirePlay, RequireUser, SessionProvider } from '@/components/session';
 import { AdminPage } from '@/pages/admin-page';
+import { AssignmentsPage } from '@/pages/assignments-page';
 import { CollectionPage } from '@/pages/collection-page';
 import { LeaderboardPage } from '@/pages/leaderboard-page';
 import { LoginPage } from '@/pages/login-page';
@@ -11,6 +13,7 @@ import { RedeemPage } from '@/pages/redeem-page';
 export function App() {
   return (
     <SessionProvider>
+      <Toaster />
       <ArProvider>
       <BrowserRouter basename={import.meta.env.BASE_URL.replace(/\/$/, '')}>
         <Routes>
@@ -36,6 +39,14 @@ export function App() {
             element={
               <RequirePlay>
                 <CollectionPage />
+              </RequirePlay>
+            }
+          />
+          <Route
+            path="/assignments"
+            element={
+              <RequirePlay>
+                <AssignmentsPage />
               </RequirePlay>
             }
           />

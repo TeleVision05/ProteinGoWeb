@@ -9,6 +9,8 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/com
 import { Input } from '@/components/ui/input';
 import { RangeSetting } from '@/components/range-setting';
 import { Label } from '@/components/ui/label';
+import { ClassDesk } from '@/components/class-desk';
+import { toast } from '@/lib/toast';
 import { api, ApiError } from '@/lib/api';
 import { CLOUD_LIMITS, type AccessCode, type AppSettings, type Quiz, type Rarity, type Spawn, type StyleName } from '@/lib/types';
 import { cn, formatWhen, RARITY_LABEL, RARITY_ORDER, UCR } from '@/lib/utils';
@@ -82,8 +84,6 @@ export function AdminPage() {
   const mapboxToken = import.meta.env.VITE_MAPBOX_TOKEN;
   const [codes, setCodes] = useState<AccessCode[]>([]);
   const [spawns, setSpawns] = useState<Spawn[]>([]);
-  const [error, setError] = useState('');
-  const [notice, setNotice] = useState('');
   const [label, setLabel] = useState('');
   const [customCode, setCustomCode] = useState('');
   const [expiresAt, setExpiresAt] = useState(tomorrowEvening);
@@ -159,7 +159,7 @@ export function AdminPage() {
   }
 
   useEffect(() => {
-    load().catch((caught) => setError(caught instanceof ApiError ? caught.message : 'Could not load admin data.'));
+    load().catch((caught) => toast.error(caught instanceof ApiError ? caught.message : 'Could not load admin data.'));
   }, []);
 
   useEffect(() => {
@@ -169,12 +169,11 @@ export function AdminPage() {
     }
     api<{ points: { latitude: number; longitude: number; weight: number }[] }>('/api/admin/heatmap')
       .then((data) => setHeat(data.points))
-      .catch((caught) => setError(caught instanceof ApiError ? caught.message : 'Could not load the heatmap.'));
+      .catch((caught) => toast.error(caught instanceof ApiError ? caught.message : 'Could not load the heatmap.'));
   }, [showHeat]);
 
   async function onCode(event: FormEvent) {
     event.preventDefault();
-    setError('');
     try {
       await api('/api/admin/codes', {
         method: 'POST',
@@ -188,12 +187,11 @@ export function AdminPage() {
       setCustomCode('');
       await load();
     } catch (caught) {
-      setError(caught instanceof ApiError ? caught.message : 'Could not create the code.');
+      toast.error(caught instanceof ApiError ? caught.message : 'Could not create the code.');
     }
   }
 
   async function saveSetting(patch: Partial<typeof settings>) {
-    setError('');
     const previous = settings;
     setSettings({ ...settings, ...patch });
     try {
@@ -202,7 +200,7 @@ export function AdminPage() {
       );
     } catch (caught) {
       setSettings(previous);
-      setError(caught instanceof ApiError ? caught.message : 'Could not save that setting.');
+      toast.error(caught instanceof ApiError ? caught.message : 'Could not save that setting.');
     }
   }
 
@@ -235,7 +233,6 @@ export function AdminPage() {
     const fromLibrary = library.find((entry) => fileName(entry.url) === current)?.group ?? '';
     setGroup(fromLibrary);
     setModelTab(fromLibrary || !spawn.styles.length ? 'library' : 'upload');
-    setError('');
   }
 
   function startCreate() {
@@ -272,7 +269,6 @@ export function AdminPage() {
 
   async function onSpawn(event: FormEvent) {
     event.preventDefault();
-    setError('');
     setBusy(true);
     try {
       const body = new FormData();
@@ -310,32 +306,29 @@ export function AdminPage() {
       resetForm();
       await load();
     } catch (caught) {
-      setError(caught instanceof ApiError ? caught.message : 'Could not place that protein.');
+      toast.error(caught instanceof ApiError ? caught.message : 'Could not place that protein.');
     } finally {
       setBusy(false);
     }
   }
 
   async function moveSpawn(id: string, lat: number, lng: number) {
-    setError('');
     const before = spawns;
     setSpawns((current) => current.map((item) => (item.id === id ? { ...item, latitude: lat, longitude: lng } : item)));
     try {
       await api(`/api/admin/spawns/${id}`, { method: 'PATCH', body: JSON.stringify({ latitude: lat, longitude: lng }) });
-      setNotice('Moved.');
+      toast.success('Moved.');
       await load();
     } catch (caught) {
       setSpawns(before);
-      setError(caught instanceof ApiError ? caught.message : 'Could not move that protein.');
+      toast.error(caught instanceof ApiError ? caught.message : 'Could not move that protein.');
     }
   }
 
   async function onScatter(event: FormEvent) {
     event.preventDefault();
-    setError('');
-    setNotice('');
     if (!scatterTemplate) {
-      setError('Pick a protein to copy.');
+      toast.error('Pick a protein to copy.');
       return;
     }
     setBusy(true);
@@ -351,11 +344,11 @@ export function AdminPage() {
           namePrefix: scatterPrefix.trim() || undefined,
         }),
       });
-      setNotice(`Placed ${created.length} copies.`);
+      toast.success(`Placed ${created.length} copies.`);
       setScatterOpen(false);
       await load();
     } catch (caught) {
-      setError(caught instanceof ApiError ? caught.message : 'Could not scatter copies.');
+      toast.error(caught instanceof ApiError ? caught.message : 'Could not scatter copies.');
     } finally {
       setBusy(false);
     }
@@ -375,8 +368,6 @@ export function AdminPage() {
   }, [spawns, spawnSearch, spawnRarity, spawnStatus]);
 
   function openScatter() {
-    setError('');
-    setNotice('');
     if (!scatterTemplate && spawns.length) setScatterTemplate(spawns[0].id);
     setScatterOpen(true);
   }
@@ -614,8 +605,6 @@ export function AdminPage() {
           <Link to="/">Back to map</Link>
         </Button>
       </header>
-      {error ? <p className="text-sm text-destructive">{error}</p> : null}
-      {notice ? <p className="text-sm text-emerald-700">{notice}</p> : null}
       <Card>
         <CardHeader>
           <CardTitle>Settings</CardTitle>
@@ -891,6 +880,7 @@ export function AdminPage() {
           </CardContent>
         </Card>
       </section>
+      <ClassDesk spawns={spawns} />
       {editingId || creating ? (
         <div
           className="fixed inset-0 z-50 grid place-items-start justify-items-center overflow-auto bg-black/50 p-4"
@@ -943,7 +933,6 @@ export function AdminPage() {
                 )}
               </div>
               <p className="text-xs text-muted-foreground">Click the map to set the center (white dot).</p>
-              {error ? <p className="text-sm text-destructive">{error}</p> : null}
               <form onSubmit={onScatter} className="grid gap-3">
                 <div className="grid gap-2">
                   <Label htmlFor="scatter-template">Copy this protein</Label>

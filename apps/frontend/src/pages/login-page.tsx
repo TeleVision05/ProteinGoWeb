@@ -5,6 +5,7 @@ import { Button } from '@/components/ui/button';
 import { useSession } from '@/components/session';
 import { api, ApiError } from '@/lib/api';
 import { authClient } from '@/lib/auth-client';
+import { toast } from '@/lib/toast';
 
 type DevAccount = { role: 'admin' | 'student'; email: string; name: string; isAdmin: boolean };
 
@@ -14,7 +15,6 @@ export function LoginPage() {
   const [googleReady, setGoogleReady] = useState(true);
   const [pending, setPending] = useState(false);
   const [devAccounts, setDevAccounts] = useState<DevAccount[]>([]);
-  const [devError, setDevError] = useState('');
   const failed = params.has('error');
 
   useEffect(() => {
@@ -27,14 +27,21 @@ export function LoginPage() {
       .catch(() => setGoogleReady(false));
   }, []);
 
+  useEffect(() => {
+    if (failed) toast.error('Sign-in stopped. Use the Google account for your ucr.edu address.');
+  }, [failed]);
+
+  useEffect(() => {
+    if (!googleReady) toast.error('Google sign-in is not configured on the server yet. Add the client id and secret, then reload.');
+  }, [googleReady]);
+
   async function devSignIn(role: DevAccount['role']) {
     setPending(true);
-    setDevError('');
     try {
       await api('/api/dev/login', { method: 'POST', body: JSON.stringify({ role }) });
       await refresh();
     } catch (caught) {
-      setDevError(caught instanceof ApiError ? caught.message : 'Could not sign in.');
+      toast.error(caught instanceof ApiError ? caught.message : 'Could not sign in.');
       setPending(false);
     }
   }
@@ -61,16 +68,6 @@ export function LoginPage() {
           <p className="mt-2 text-sm text-muted-foreground">
             A class code still has to be entered after sign-in. There is no password.
           </p>
-          {failed ? (
-            <p className="mt-4 rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive">
-              Sign-in stopped. Use the Google account for your ucr.edu address.
-            </p>
-          ) : null}
-          {!googleReady ? (
-            <p className="mt-4 text-sm text-muted-foreground">
-              Google OAuth is not configured on the server yet. Add the client id and secret, then reload.
-            </p>
-          ) : null}
           <Button
             className="mt-6 w-full"
             size="lg"
@@ -111,7 +108,6 @@ export function LoginPage() {
                   </Button>
                 ))}
               </div>
-              {devError ? <p className="mt-2 text-sm text-destructive">{devError}</p> : null}
             </div>
           ) : null}
         </div>

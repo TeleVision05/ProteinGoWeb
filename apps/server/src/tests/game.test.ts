@@ -2,11 +2,21 @@
 import assert from 'node:assert/strict';
 import { after, before, describe, it } from 'node:test';
 import type { ExecutionContext } from '@nestjs/common';
-import { eq, inArray } from 'drizzle-orm';
+import { and, eq, inArray } from 'drizzle-orm';
 import { AdminGuard } from '../auth.guard';
 import { user } from '../db/auth-schema';
 import { db, pool } from '../db/db';
-import { accessCode, capture, codeRedemption, spawn } from '../db/game-schema';
+import { accessCode, assignment, capture, codeRedemption, quizAttempt, spawn } from '../db/game-schema';
+import {
+  completionCode,
+  createAssignment,
+  deleteAssignment,
+  getRoster,
+  listAdminAssignments,
+  listMyAssignments,
+  newlyCompleted,
+  rosterCsv,
+} from '../assignments';
 import {
   GameError,
   catchSpawn,
@@ -37,6 +47,7 @@ const HERE = { latitude: 33.9737, longitude: -117.3281 };
 const NEAR = { latitude: 33.97371, longitude: -117.32811 };
 const userIds: string[] = [];
 const spawnIds: string[] = [];
+const assignmentIds: string[] = [];
 let originalLeaderboard = false;
 let originalRarity = true;
 let previousCatchAnywhere: string | undefined;
@@ -98,6 +109,7 @@ after(async () => {
   if (previousCatchAnywhere === undefined) delete process.env.CATCH_ANYWHERE;
   else process.env.CATCH_ANYWHERE = previousCatchAnywhere;
   await updateSettings({ leaderboardEnabled: originalLeaderboard, rarityEnabled: originalRarity });
+  if (assignmentIds.length) await db.delete(assignment).where(inArray(assignment.id, assignmentIds));
   if (spawnIds.length) {
     await db.delete(capture).where(inArray(capture.spawnId, spawnIds));
     await db.delete(spawn).where(inArray(spawn.id, spawnIds));
@@ -551,5 +563,171 @@ describe('admin guard', () => {
       () => new AdminGuard().canActivate(context('student@ucr.edu')),
       (error: unknown) => error instanceof GameError && error.status === 403,
     );
+  });
+});
+
+/** Lets a wrong answer's cool-down pass without waiting for it. */
+async function skipCooldown(userId: string) {
+  await db.update(quizAttempt).set({ createdAt: new Date(Date.now() - 60_000) }).where(eq(quizAttempt.userId, userId));
+}
+
+describe('quiz attempts', () => {
+  const quiz = { question: 'What carries oxygen in blood?', options: ['Actin', 'Hemoglobin', 'Keratin'], answerIndex: 1 };
+
+  it('records every answer, and a wrong one means no first-try bonus', async () => {
+    const userId = await makeUser('retrier');
+    const row = await makeSpawn({ quiz });
+    await fails(catchSpawn({ userId, spawnId: row.id, ...NEAR, answer: 2 }), 422);
+    // Too soon: turned away before it is recorded as an answer.
+    await fails(catchSpawn({ userId, spawnId: row.id, ...NEAR, answer: 1 }), 429);
+    let rows = await db.select().from(quizAttempt).where(and(eq(quizAttempt.userId, userId), eq(quizAttempt.spawnId, row.id)));
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].correct, false);
+    assert.equal(rows[0].answerIndex, 2);
+
+    await skipCooldown(userId);
+    const result = await catchSpawn({ userId, spawnId: row.id, ...NEAR, answer: 1 });
+    assert.equal(result.bonus, 0);
+    rows = await db.select().from(quizAttempt).where(and(eq(quizAttempt.userId, userId), eq(quizAttempt.spawnId, row.id)));
+    assert.deepEqual(rows.map((item) => item.correct).sort(), [false, true]);
+    const [caught] = await db.select().from(capture).where(and(eq(capture.userId, userId), eq(capture.spawnId, row.id)));
+    assert.equal(caught.attempts, 2);
+  });
+
+  it('refuses an answer that is not one of the options', async () => {
+    const userId = await makeUser('wild');
+    const row = await makeSpawn({ quiz });
+    await fails(catchSpawn({ userId, spawnId: row.id, ...NEAR, answer: 7 }), 400);
+    await fails(catchSpawn({ userId, spawnId: row.id, ...NEAR, answer: -1 }), 400);
+  });
+});
+
+describe('assignments', () => {
+  async function makeAssignment(spawns: string[], extra: { title?: string; dueAt?: Date | null } = {}) {
+    const row = await createAssignment({
+      title: extra.title ?? `Lab ${run}`,
+      dueAt: extra.dueAt ?? null,
+      spawnIds: spawns,
+      createdBy: userIds[0],
+    });
+    assignmentIds.push(row.id);
+    return row;
+  }
+
+  it('checks the title, the proteins and the due date', async () => {
+    const one = await makeSpawn();
+    const base = { dueAt: null, createdBy: userIds[0] };
+    await fails(createAssignment({ ...base, title: 'x', spawnIds: [one.id] }), 400, /title/);
+    await fails(createAssignment({ ...base, title: 'Lab', spawnIds: [] }), 400, /at least one/);
+    await fails(createAssignment({ ...base, title: 'Lab', spawnIds: [one.id, 'no-such-protein'] }), 400, /no longer exists/);
+    await fails(createAssignment({ ...base, title: 'Lab', dueAt: new Date('nope'), spawnIds: [one.id] }), 400, /due date/);
+  });
+
+  it('is done when every protein is caught, and then gives a code that belongs to the student', async () => {
+    const first = await makeSpawn();
+    const second = await makeSpawn();
+    const row = await makeAssignment([first.id, second.id]);
+    const userId = await makeUser('finisher');
+    const mine = async () => (await listMyAssignments(userId)).find((item) => item.id === row.id)!;
+
+    await catchSpawn({ userId, spawnId: first.id, ...NEAR });
+    let view = await mine();
+    assert.equal(view.caught, 1);
+    assert.equal(view.total, 2);
+    assert.equal(view.done, false);
+    assert.equal(view.code, null);
+    assert.deepEqual(await newlyCompleted(userId, first.id), []);
+
+    await catchSpawn({ userId, spawnId: second.id, ...NEAR });
+    view = await mine();
+    assert.equal(view.done, true);
+    assert.match(view.code ?? '', /^[A-Z2-9]{4}-[A-Z2-9]{4}$/);
+    assert.equal(view.code, completionCode(row.id, userId));
+    assert.equal(view.late, false);
+    const finished = await newlyCompleted(userId, second.id);
+    assert.deepEqual(finished.map((item) => item.id), [row.id]);
+    assert.equal(finished[0].code, view.code);
+
+    const other = userIds[1];
+    assert.notEqual(completionCode(row.id, other), view.code);
+  });
+
+  it('marks a finish after the due date as late, without blocking it', async () => {
+    const one = await makeSpawn();
+    const row = await makeAssignment([one.id], { dueAt: new Date(Date.now() - 86_400_000) });
+    const userId = await makeUser('latecomer');
+    await catchSpawn({ userId, spawnId: one.id, ...NEAR });
+    const view = (await listMyAssignments(userId)).find((item) => item.id === row.id)!;
+    assert.equal(view.done, true);
+    assert.equal(view.late, true);
+  });
+
+  it('can be deleted, and losing a protein shrinks the set', async () => {
+    const keep = await makeSpawn();
+    const drop = await makeSpawn();
+    const row = await makeAssignment([keep.id, drop.id]);
+    await db.delete(spawn).where(eq(spawn.id, drop.id));
+    const listed = (await listAdminAssignments()).find((item) => item.id === row.id)!;
+    assert.deepEqual(listed.spawns.map((item) => item.id), [keep.id]);
+    await deleteAssignment(row.id);
+    assert.equal((await listAdminAssignments()).some((item) => item.id === row.id), false);
+    await fails(deleteAssignment(row.id), 404);
+  });
+});
+
+describe('roster', () => {
+  const quiz = { question: 'What carries oxygen in blood?', options: ['Actin', 'Hemoglobin', 'Keratin'], answerIndex: 1 };
+
+  it('shows each student with progress, and the questions they got wrong', async () => {
+    const hard = await makeSpawn({ quiz, name: `Hard ${run}` });
+    const plain = await makeSpawn({ name: `Plain ${run}` });
+    const row = await createAssignment({ title: `Roster ${run}`, dueAt: null, spawnIds: [hard.id, plain.id], createdBy: userIds[0] });
+    assignmentIds.push(row.id);
+
+    const fast = await makeUser('fast', 'Fran Fast');
+    const slow = await makeUser('slow', 'Sol Slow');
+    await catchSpawn({ userId: fast, spawnId: hard.id, ...NEAR, answer: 1 });
+    await catchSpawn({ userId: fast, spawnId: plain.id, ...NEAR });
+    await fails(catchSpawn({ userId: slow, spawnId: hard.id, ...NEAR, answer: 2 }), 422);
+    await skipCooldown(slow);
+    await catchSpawn({ userId: slow, spawnId: hard.id, ...NEAR, answer: 1 });
+
+    const roster = await getRoster(row.id);
+    assert.equal(roster.assignment?.id, row.id);
+    const fastRow = roster.students.find((item) => item.userId === fast)!;
+    const slowRow = roster.students.find((item) => item.userId === slow)!;
+    assert.equal(fastRow.assignment?.done, true);
+    assert.equal(fastRow.assignment?.code, completionCode(row.id, fast));
+    assert.equal(fastRow.firstTry, 1);
+    assert.equal(slowRow.assignment?.done, false);
+    assert.equal(slowRow.assignment?.caught, 1);
+    assert.equal(slowRow.assignment?.code, null);
+    assert.equal(slowRow.wrongAnswers, 1);
+    assert.equal(slowRow.firstTry, 0);
+
+    // Only the quiz protein is a question, and it shows the popular wrong answer.
+    assert.deepEqual(roster.questions.map((item) => item.spawnId), [hard.id]);
+    const [question] = roster.questions;
+    assert.equal(question.caught, 2);
+    assert.equal(question.firstTryPercent, 50);
+    assert.equal(question.wrongAnswers, 1);
+    assert.deepEqual(question.topWrong, { answer: 'Keratin', count: 1 });
+
+    await assert.rejects(getRoster('no-such-assignment'), (error: unknown) => error instanceof GameError && error.status === 404);
+  });
+
+  it('exports a CSV that a spreadsheet cannot turn into a formula', async () => {
+    const one = await makeSpawn();
+    const row = await createAssignment({ title: `CSV ${run}`, dueAt: null, spawnIds: [one.id], createdBy: userIds[0] });
+    assignmentIds.push(row.id);
+    const evil = await makeUser('evil', '=HYPERLINK("http://x"), Evil');
+    await catchSpawn({ userId: evil, spawnId: one.id, ...NEAR });
+
+    const file = await rosterCsv(row.id);
+    assert.match(file.filename, /^proteingo-roster-\d{4}-\d{2}-\d{2}\.csv$/);
+    assert.ok(file.body.startsWith('﻿Name,Email,Section,'));
+    assert.ok(file.body.includes('"\'=HYPERLINK(""http://x""), Evil"'), 'formula is quoted and defused');
+    assert.ok(file.body.includes(completionCode(row.id, evil)));
+    assert.ok(file.body.includes('Completion code'));
   });
 });
