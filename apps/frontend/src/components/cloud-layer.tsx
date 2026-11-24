@@ -3,7 +3,7 @@ import type { MapRef } from 'react-map-gl/mapbox';
 import { UCR } from '@/lib/utils';
 
 /**
- * Dynamic cloud cover: a soft, drifting cloud layer over the whole map. It dissolves in a circle around the player,
+ * Dynamic cloud cover: a soft, drifting fog layer over the whole map. It dissolves in a circle around the player,
  * and shows a big colored glow inside the clouds where a protein is hiding.
  *
  * It is one full-screen shader drawn on its own small canvas laid over the map (the map keeps working underneath),
@@ -72,64 +72,32 @@ float fbm(vec2 p) {
   }
   return s;
 }
-// A field of overlapping round domes (hemispheres) around jittered points: the bulbs of a cumulus cloud.
-// Returns the height in .x and the slope in .yz, so the shading can use each dome's real surface angle.
-vec3 domes(vec2 p, float t) {
-  vec2 i = floor(p);
-  vec2 f = fract(p);
-  float hsum = 0.0, wsum = 0.0;
-  vec2 ssum = vec2(0.0);
-  for (int y = -1; y <= 1; y++) {
-    for (int x = -1; x <= 1; x++) {
-      vec2 g = vec2(float(x), float(y));
-      vec2 cell = i + g;
-      float h1 = hash(cell);
-      float h2 = hash(cell + 19.7);
-      float h3 = hash(cell + 7.1);
-      // Each bulb slowly breathes: its center wanders a little around its home spot.
-      vec2 c = vec2(0.2 + 0.6 * h1, 0.2 + 0.6 * h2) + 0.14 * vec2(sin(t * 0.17 + 6.283 * h2), cos(t * 0.13 + 6.283 * h1));
-      float rad = 0.62 + 0.45 * h3;
-      vec2 d = g + c - f;                          // from this pixel to the bulb's center
-      float r2 = dot(d, d) / (rad * rad);
-      if (r2 < 1.0) {
-        float dome = sqrt(1.0 - r2) * rad;         // height of a hemisphere
-        float wgt = dome * dome * dome;            // taller bulbs count for more where two overlap: a soft union
-        hsum += wgt * dome;
-        ssum += wgt * (d / max(dome, 0.15));
-        wsum += wgt;
-      }
-    }
-  }
-  float inv = 1.0 / max(wsum, 0.0001);
-  return vec3(hsum * inv, ssum * inv);
-}
-
 void main() {
   vec2 w = mix(mix(uBL, uBR, vUv.x), mix(uTL, uTR, vUv.x), vUv.y);
   float t = uTime;
 
-  // Bulbs about 150 m across, drifting slowly and gently changing (the warp moves against the wind).
-  vec2 q = w / 300.0;
-  float warp = fbm(q * 0.5 + vec2(-t * 0.004, t * 0.003) + 7.3);
-  vec2 qq = q + vec2(t * 0.010, t * 0.004) + warp * 0.5;
-  // Wobble the shapes so the bulbs are lumpy and irregular rather than neat rounds.
-  qq += 0.30 * (vec2(fbm(qq * 1.9 + 2.1), fbm(qq * 1.9 + 8.7)) - 0.5);
-  float big = fbm(qq * 0.45 + 3.1);                       // large-scale variation, used for the ragged edges
+  // Fog: broad, soft banks that drift slowly and keep changing shape. The slow warp moves against the wind.
+  vec2 q = w / 380.0;
+  vec2 wind = vec2(t * 0.012, t * 0.005);
+  float warp = fbm(q * 0.6 + vec2(-t * 0.004, t * 0.003) + 7.3);
+  vec2 p = q + wind + warp * 0.9;
 
-  vec3 bulbs = domes(qq, t);                              // big bulbs
-  vec3 fine = domes(qq * 2.3 + 5.7, t * 1.3);             // small bulbs growing on them
-  float height = bulbs.x + 0.22 * fine.x;
-  vec2 slope = bulbs.yz + 0.25 * fine.yz;
+  float banks = fbm(p);                                              // broad banks of thicker and thinner fog
+  float wisps = fbm(vec2(p.x * 0.55, p.y * 1.5) + vec2(t * 0.006, -t * 0.002) + 4.4); // long streaks, drifting at their own pace
+  float grain = fbm(p * 2.6 - wind * 1.6 + 9.1);                     // fine, faint texture
+  float density = banks * 0.55 + wisps * 0.30 + grain * 0.15;
 
-  // Lit from the up-left: bright on the side of each bulb that faces the light, soft blue-grey on the other side.
-  vec3 normal = normalize(vec3(-slope, 1.3));
-  vec3 toLight = normalize(vec3(-0.45, 0.6, 0.65));
-  float diffuse = clamp(dot(normal, toLight), 0.0, 1.0);
-  float open = smoothstep(0.0, 0.40, height);             // the gaps and creases between bulbs are darker
-  vec3 shade = vec3(0.60, 0.70, 0.86);
-  vec3 light = vec3(1.0, 1.0, 1.0);
-  vec3 col = mix(shade, light, clamp(diffuse * 0.95 + 0.10, 0.0, 1.0) * mix(0.55, 1.0, open));
-  float body = 1.0;                                       // solid: the clouds do not show the map through them
+  // A very gentle sense of depth: the banks are a touch brighter on the side facing the light (up and left).
+  float banksLit = fbm(p + vec2(-0.05, 0.06));
+  float depth = clamp(0.5 + (banks - banksLit) * 3.0, 0.0, 1.0);
+
+  // Thin fog is a cool grey, thick fog is near white.
+  vec3 thin = vec3(0.66, 0.73, 0.80);
+  vec3 thick = vec3(0.97, 0.98, 0.99);
+  float whiteness = smoothstep(0.28, 0.72, density) * 0.85 + depth * 0.15;
+  vec3 col = mix(thin, thick, clamp(whiteness, 0.0, 1.0));
+  float big = banks;                                                 // used below for the ragged edges
+  float body = 1.0;                                                  // solid: the map does not show through at 0% transparency
 
   // Clear circle around the player, with a ragged, wispy edge.
   float d = length(w - uUser);
