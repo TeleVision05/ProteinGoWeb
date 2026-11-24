@@ -23,6 +23,7 @@ import {
   deleteSpawn,
   getAccess,
   getChallenge,
+  getExplored,
   getCollection,
   getLeaderboard,
   getProgress,
@@ -31,6 +32,7 @@ import {
   listAdminSpawns,
   listCodes,
   listPlaySpawns,
+  markExplored,
   readSpawnModel,
   redeemCode,
   revokeCode,
@@ -221,6 +223,19 @@ export class GameController {
     const longitude = lng === undefined || lng === '' ? NaN : Number(lng);
     const valid = Number.isFinite(latitude) && Number.isFinite(longitude) && Math.abs(latitude) <= 90 && Math.abs(longitude) <= 180;
     return listPlaySpawns(request.user.id, valid ? { latitude, longitude } : null);
+  }
+
+  /** The map squares this player has walked through (cloud cover keeps them cleared). */
+  @Get('explored')
+  @UseGuards(AuthGuard, PlayGuard)
+  explored(@Req() request: AuthedRequest) {
+    return getExplored(request.user.id);
+  }
+
+  @Post('explored')
+  @UseGuards(AuthGuard, PlayGuard)
+  markExplored(@Req() request: AuthedRequest, @Body() body: { latitude?: number; longitude?: number }) {
+    return markExplored(request.user.id, body?.latitude, body?.longitude);
   }
 
   @Post('spawns/:id/catch')

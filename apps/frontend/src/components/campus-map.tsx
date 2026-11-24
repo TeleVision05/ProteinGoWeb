@@ -2,11 +2,9 @@ import 'mapbox-gl/dist/mapbox-gl.css';
 import { useEffect, useMemo, useRef } from 'react';
 import Map, { Layer, Marker, Source, type MapRef } from 'react-map-gl/mapbox';
 import { CloudLayer } from '@/components/cloud-layer';
-import { circlePolygon, distanceMeters, RARITY_HEX, UCR } from '@/lib/utils';
+import type { ExploredStore } from '@/lib/explored';
+import { circlePolygon, RARITY_HEX, UCR } from '@/lib/utils';
 import type { Spawn } from '@/lib/types';
-
-/** Must match the server's margin: it sends the real place of a protein only within the dissolve radius plus this. */
-const CLOUD_MARKER_MARGIN = 60;
 
 type Props = {
   token: string;
@@ -30,6 +28,8 @@ type Props = {
   heatmap?: { latitude: number; longitude: number; weight: number }[] | null;
   /** Player map: cover the whole map in clouds that dissolve around the player and glow where proteins hide. */
   clouds?: { dissolveRadius: number; hintRadius: number; transparency: number } | null;
+  /** The squares the player has walked through; the fog stays cleared there. */
+  explored?: ExploredStore | null;
   onSelect: (id: string) => void;
   onPick?: (point: { lat: number; lng: number }) => void;
   className?: string;
@@ -50,6 +50,7 @@ export function CampusMap({
   showCoverage,
   heatmap,
   clouds,
+  explored,
   onSelect,
   onPick,
   className,
@@ -102,24 +103,18 @@ export function CampusMap({
   );
 
   const colorOf = (spawn: Spawn) => (rarityColors ? (RARITY_HEX[spawn.rarity] ?? RARITY_HEX.common) : RARITY_HEX.common);
-  // Under clouds: a protein shows as a marker only inside the cleared circle around the player. Every other one
-  // (and any the server marked hidden) is only a colored glow in the clouds, and not once it has been caught.
-  const markers = clouds
-    ? spawns.filter(
-        (spawn) =>
-          !spawn.hidden && user != null && distanceMeters(user.lat, user.lng, spawn.latitude, spawn.longitude) <= clouds.dissolveRadius + CLOUD_MARKER_MARGIN,
-      )
-    : spawns;
+  // Under clouds the server decides what the player has found: a protein it marks hidden (not near, not on explored
+  // ground) is only a colored glow in the fog, never a marker, and not even a glow once it has been caught.
+  const markers = clouds ? spawns.filter((spawn) => !spawn.hidden) : spawns;
   const hints = useMemo(
     () =>
       clouds
         ? spawns
-            .filter((spawn) => !spawn.caught)
-            .filter((spawn) => spawn.hidden || user == null || distanceMeters(user.lat, user.lng, spawn.latitude, spawn.longitude) > clouds.dissolveRadius + CLOUD_MARKER_MARGIN)
+            .filter((spawn) => spawn.hidden && !spawn.caught)
             .map((spawn) => ({ lat: spawn.latitude, lng: spawn.longitude, color: colorOf(spawn) }))
         : [],
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [clouds, spawns, user, rarityColors],
+    [clouds, spawns, rarityColors],
   );
 
   const center = user ?? UCR;
@@ -188,6 +183,7 @@ export function CampusMap({
           hintRadius={clouds.hintRadius}
           transparency={clouds.transparency}
           hints={hints}
+          explored={explored}
         />
       ) : null}
     </div>

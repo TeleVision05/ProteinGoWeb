@@ -3,6 +3,7 @@ import type { ChallengeOutcome } from '@/ar/viewer';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { HeaderNav, type NavItem } from '@/components/header-nav';
 import { CampusMap } from '@/components/campus-map';
+import { ExploredStore, type ExploredInfo } from '@/lib/explored';
 import { useSession } from '@/components/session';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -26,8 +27,6 @@ type GeoState = 'unknown' | 'granted' | 'prompt' | 'denied' | 'unsupported';
 type QuizState = { spawn: Spawn; question: string; options: string[]; message: string; busy: boolean };
 
 const GPS_TOLERANCE = 25;
-/** Matches the server: under clouds it sends a protein's real place only within the dissolve radius plus this. */
-const CLOUD_MARKER_MARGIN = 60;
 const POOR_ACCURACY = 50;
 
 export function MapPage() {
@@ -58,6 +57,20 @@ export function MapPage() {
   const fetchedAt = useRef<Here | null>(null);
   const cloudsOn = Boolean(me?.settings?.cloudsEnabled) && !me?.catchAnywhere;
   const cloudDissolve = me?.settings?.cloudDissolveRadius ?? 120;
+
+  // The ground the player has walked through stays cleared of fog. It is kept on the server (so it follows them
+  // between devices), loaded once, and a new 25 m square is reported as they walk into it.
+  const explored = useMemo(() => new ExploredStore(), []);
+  useEffect(() => {
+    if (!cloudsOn) return;
+    api<ExploredInfo>('/api/explored').then((info) => explored.load(info)).catch(() => undefined);
+  }, [cloudsOn, explored]);
+  useEffect(() => {
+    if (!cloudsOn || !here || here.accuracy > 80) return;
+    const cell = explored.cellOf(here.lat, here.lng);
+    if (!cell || !explored.add(cell.cx, cell.cy)) return;
+    api('/api/explored', { method: 'POST', body: JSON.stringify({ latitude: here.lat, longitude: here.lng }) }).catch(() => undefined);
+  }, [cloudsOn, here, explored]);
 
   useEffect(() => {
     if (arActive) return;
@@ -141,19 +154,9 @@ export function MapPage() {
     return () => navigator.geolocation.clearWatch(watch);
   }, [arActive, geoRetry]);
 
-  // Under clouds, only proteins inside the cleared circle count as seen: the rest are just hints in the sky.
-  const visibleSpawns = useMemo(
-    () =>
-      cloudsOn
-        ? spawns.filter(
-            (spawn) =>
-              !spawn.hidden &&
-              here != null &&
-              distanceMeters(here.lat, here.lng, spawn.latitude, spawn.longitude) <= cloudDissolve + CLOUD_MARKER_MARGIN,
-          )
-        : spawns,
-    [spawns, cloudsOn, here, cloudDissolve],
-  );
+  // Under clouds, only proteins the server has revealed (near the player, or on ground they have explored) count as
+  // seen: the rest are just glows in the fog.
+  const visibleSpawns = useMemo(() => (cloudsOn ? spawns.filter((spawn) => !spawn.hidden) : spawns), [spawns, cloudsOn]);
   const selected = visibleSpawns.find((spawn) => spawn.id === selectedId) ?? null;
   const distance = useMemo(() => {
     if (!selected || !here) return null;
@@ -403,6 +406,7 @@ export function MapPage() {
             followUser
             flyToSelected
             rarityColors={me?.settings?.rarityEnabled !== false}
+            explored={cloudsOn ? explored : null}
             clouds={
               cloudsOn
                 ? {

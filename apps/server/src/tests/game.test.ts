@@ -14,13 +14,17 @@ import {
   createCode,
   createSpawn,
   distanceMeters,
+  exploreCellCenter,
+  exploreCellOf,
   getChallenge,
+  getExplored,
   getCollection,
   getLeaderboard,
   getProgress,
   getSettings,
   listAdminSpawns,
   listPlaySpawns,
+  markExplored,
   redeemCode,
   scatterSpawns,
   updateSettings,
@@ -334,6 +338,44 @@ describe('dynamic cloud cover', () => {
     await updateSettings({ cloudsEnabled: false });
     const plain = await listPlaySpawns(userIds[0], null);
     assert.ok(plain.filter((s) => [near.id, far.id].includes(s.id)).every((s) => !s.hidden));
+  });
+
+  it('maps a position to a 25 m square and back', () => {
+    const cell = exploreCellOf(CAMPUS.latitude, CAMPUS.longitude);
+    assert.ok(cell);
+    const center = exploreCellCenter(cell.cx, cell.cy);
+    assert.ok(distanceMeters(CAMPUS.latitude, CAMPUS.longitude, center.latitude, center.longitude) <= 20); // within a square's half-diagonal
+    assert.equal(exploreCellOf(center.latitude, center.longitude)?.cx, cell.cx);
+    assert.equal(exploreCellOf(CAMPUS.latitude + 0.5, CAMPUS.longitude), null); // far off the grid
+  });
+
+  it('remembers squares only while cloud cover is on, once each, and rejects bad positions', async () => {
+    await updateSettings({ cloudsEnabled: false });
+    assert.deepEqual(await markExplored(userIds[1], CAMPUS.latitude, CAMPUS.longitude), { added: false });
+    assert.equal((await getExplored(userIds[1])).cells.length, 0);
+    await updateSettings({ cloudsEnabled: true });
+    assert.deepEqual(await markExplored(userIds[1], CAMPUS.latitude, CAMPUS.longitude), { added: true });
+    assert.deepEqual(await markExplored(userIds[1], CAMPUS.latitude, CAMPUS.longitude), { added: false });
+    assert.equal((await getExplored(userIds[1])).cells.length, 1);
+    await fails(markExplored(userIds[1], 'north' as unknown as number, 0), 400);
+    await fails(markExplored(userIds[1], 500, 0), 400);
+  });
+
+  it('keeps a protein visible where the player has been, even after they leave', async () => {
+    await updateSettings({ cloudsEnabled: true, cloudDissolveRadius: 100, cloudHintRadius: 400 });
+    resetRateLimits();
+    const spot = { latitude: CAMPUS.latitude + 0.002, longitude: CAMPUS.longitude };
+    const row = await makeSpawn({ name: 'Explored one' }, spot);
+    const far = { latitude: spot.latitude + 0.01, longitude: spot.longitude }; // about 1 km away
+    const before = (await listPlaySpawns(userIds[0], far)).find((s) => s.id === row.id);
+    assert.equal(before?.hidden, true);
+    await markExplored(userIds[0], spot.latitude, spot.longitude);
+    const after = (await listPlaySpawns(userIds[0], far)).find((s) => s.id === row.id);
+    assert.equal(after?.hidden, false);
+    assert.equal(after?.latitude, spot.latitude);
+    // Someone who never went there still cannot see it.
+    const other = (await listPlaySpawns(userIds[1], far)).find((s) => s.id === row.id);
+    assert.equal(other?.hidden, true);
   });
 
   it('does not hide anything in the catch-anywhere test mode', async () => {

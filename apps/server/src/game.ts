@@ -2,7 +2,7 @@ import { createHmac } from 'node:crypto';
 import { and, desc, eq, gt, inArray, isNull, or, sql } from 'drizzle-orm';
 import { db } from './db/db';
 import { user } from './db/auth-schema';
-import { accessCode, appSetting, capture, codeRedemption, spawn, type ModelVariant } from './db/game-schema';
+import { accessCode, appSetting, capture, codeRedemption, exploredCell, spawn, type ModelVariant } from './db/game-schema';
 import { buildAchievements, isRarity, levelFor, publicName, rewardFor, streaks, RARITIES, type ProgressStats, type Rarity } from './progress';
 import { rateLimited } from './rate-limit';
 import { deleteModel, putModel, readBundledModel, readModel } from './storage';
@@ -376,9 +376,81 @@ export function cloudHintCenter(id: string, latitude: number, longitude: number,
 }
 
 /**
- * The spawns a player sees. With dynamic cloud cover on, a protein beyond the dissolve radius is sent with a
- * nudged location and no summary (hidden: true), so its real position is not in the response at all. The game's
- * own rules still use the real position on the server.
+ * The explored grid. Squares are 25 m, counted east and north from a fixed point on campus (the app's map must use
+ * the same point and size; it reads them from GET /api/explored). Squares more than 3 km out are ignored.
+ */
+export const EXPLORE = { originLat: 33.9737, originLng: -117.3281, cellMeters: 25, maxCell: 120 } as const;
+
+export function exploreCellOf(latitude: number, longitude: number) {
+  const east = (longitude - EXPLORE.originLng) * 111_320 * Math.cos((EXPLORE.originLat * Math.PI) / 180);
+  const north = (latitude - EXPLORE.originLat) * 110_574;
+  const cx = Math.floor(east / EXPLORE.cellMeters);
+  const cy = Math.floor(north / EXPLORE.cellMeters);
+  if (Math.abs(cx) > EXPLORE.maxCell || Math.abs(cy) > EXPLORE.maxCell) return null;
+  return { cx, cy };
+}
+
+export function exploreCellCenter(cx: number, cy: number) {
+  const east = (cx + 0.5) * EXPLORE.cellMeters;
+  const north = (cy + 0.5) * EXPLORE.cellMeters;
+  return {
+    latitude: EXPLORE.originLat + north / 110_574,
+    longitude: EXPLORE.originLng + east / (111_320 * Math.cos((EXPLORE.originLat * Math.PI) / 180)),
+  };
+}
+
+export async function getExplored(userId: string) {
+  const rows = await db.select({ cx: exploredCell.cx, cy: exploredCell.cy }).from(exploredCell).where(eq(exploredCell.userId, userId));
+  return {
+    originLat: EXPLORE.originLat,
+    originLng: EXPLORE.originLng,
+    cellMeters: EXPLORE.cellMeters,
+    maxCell: EXPLORE.maxCell,
+    cells: rows.map((row) => [row.cx, row.cy] as [number, number]),
+  };
+}
+
+/** Remember that the player has been through this square. Only while cloud cover is on; returns whether it was new. */
+export async function markExplored(userId: string, latitude: unknown, longitude: unknown) {
+  if (
+    typeof latitude !== 'number' || typeof longitude !== 'number' ||
+    !Number.isFinite(latitude) || !Number.isFinite(longitude) ||
+    Math.abs(latitude) > 90 || Math.abs(longitude) > 180
+  ) {
+    throw new GameError('A position is needed.', 400);
+  }
+  if (rateLimited(`explore:${userId}`, 60, 60_000)) throw new GameError('Slow down a little.', 429);
+  if (!(await getSettings()).cloudsEnabled) return { added: false };
+  const cell = exploreCellOf(latitude, longitude);
+  if (!cell) return { added: false };
+  const inserted = await db
+    .insert(exploredCell)
+    .values({ userId, cx: cell.cx, cy: cell.cy })
+    .onConflictDoNothing()
+    .returning({ cx: exploredCell.cx });
+  return { added: inserted.length > 0 };
+}
+
+/** Is there a square the player has explored whose center is within `radius` meters of this point? */
+function exploredNear(cells: Set<string>, latitude: number, longitude: number, radius: number) {
+  const home = exploreCellOf(latitude, longitude);
+  if (!home || cells.size === 0) return false;
+  const span = Math.ceil(radius / EXPLORE.cellMeters) + 1;
+  for (let dx = -span; dx <= span; dx++) {
+    for (let dy = -span; dy <= span; dy++) {
+      if (!cells.has(`${home.cx + dx},${home.cy + dy}`)) continue;
+      const center = exploreCellCenter(home.cx + dx, home.cy + dy);
+      if (distanceMeters(center.latitude, center.longitude, latitude, longitude) <= radius) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * The spawns a player sees. With dynamic cloud cover on, a protein is only shown for real when the player is within the
+ * dissolve radius of it now, or has explored the ground it stands on (the fog stays cleared there). Any other protein
+ * is sent with a nudged location and no summary (hidden: true), so its real position is not in the response at all.
+ * The game's own rules still use the real position on the server.
  */
 export async function listPlaySpawns(userId: string, here?: { latitude: number; longitude: number } | null) {
   const now = new Date();
@@ -387,6 +459,7 @@ export async function listPlaySpawns(userId: string, here?: { latitude: number; 
   const caughtIds = new Set(caught.map((row) => row.spawnId));
   const settings = await getSettings();
   const hide = settings.cloudsEnabled && !catchAnywhere();
+  const explored = hide ? new Set((await getExplored(userId)).cells.map(([cx, cy]) => `${cx},${cy}`)) : new Set<string>();
   return rows.map((row) => {
     const view = presentSpawn(row, caughtIds.has(row.id), settings.rarityEnabled);
     if (!hide) return { ...view, hidden: false };
@@ -394,7 +467,9 @@ export async function listPlaySpawns(userId: string, here?: { latitude: number; 
       here != null &&
       distanceMeters(here.latitude, here.longitude, row.latitude, row.longitude) <=
         settings.cloudDissolveRadius + CLOUD_HIDE_MARGIN_METERS;
-    if (near) return { ...view, hidden: false };
+    if (near || exploredNear(explored, row.latitude, row.longitude, settings.cloudDissolveRadius)) {
+      return { ...view, hidden: false };
+    }
     const center = cloudHintCenter(row.id, row.latitude, row.longitude, settings.cloudHintRadius);
     return { ...view, ...center, summary: null, hidden: true };
   });

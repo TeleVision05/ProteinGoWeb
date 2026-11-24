@@ -1,5 +1,6 @@
 import { useEffect, useRef, type RefObject } from 'react';
 import type { MapRef } from 'react-map-gl/mapbox';
+import type { ExploredStore } from '@/lib/explored';
 import { UCR } from '@/lib/utils';
 
 /**
@@ -22,12 +23,19 @@ type Props = {
   /** 0 to 90, percent. Higher shows more of the map through the clouds. */
   transparency: number;
   hints: CloudHint[];
+  /** The squares the player has walked through: the fog stays cleared there. */
+  explored?: ExploredStore | null;
 };
 
 const MAX_HINTS = 24;
 /** The canvas is drawn at this fraction of the screen size. Clouds are soft, so this costs almost no sharpness. */
 const RESOLUTION = 0.5;
 const FRAME_MS = 1000 / 30;
+/** The explored mask covers a square this many meters on a side around the campus point, at MASK_SIZE pixels. */
+const MASK_SPAN = 6000;
+const MASK_SIZE = 1024;
+/** Explored ground fades back to fog over a wide band: fully clear to the dissolve radius, gone at this many times it. */
+const FADE_OUT = 1.8;
 
 // Local meters from a fixed point on campus: small numbers keep the shader's math precise.
 const M_PER_DEG_LAT = 110_574;
@@ -51,6 +59,12 @@ uniform vec2 uUser;
 uniform int uCount;
 uniform vec4 uHint[${MAX_HINTS}];      // x, y, radius
 uniform vec3 uHintColor[${MAX_HINTS}];
+uniform sampler2D uExplored;       // ground the player has already cleared (white = cleared)
+
+float smoother(float a, float b, float x) {
+  float t = clamp((x - a) / (b - a), 0.0, 1.0);
+  return t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
+}
 
 float hash(vec2 p) {
   vec3 p3 = fract(vec3(p.xyx) * 0.1031);
@@ -99,10 +113,14 @@ void main() {
   float big = banks;                                                 // used below for the ragged edges
   float body = 1.0;                                                  // solid: the map does not show through at 0% transparency
 
-  // Clear circle around the player, with a ragged, wispy edge.
+  // Where the player is now: fully clear within the dissolve radius, then a long soft fade back into fog.
   float d = length(w - uUser);
-  float edge = d + (big - 0.5) * uDissolve * 0.7;
-  float cover = mix(1.0, smoothstep(uDissolve, uDissolve * 1.45, edge), uHasUser);
+  float edge = d + (big - 0.5) * uDissolve * 0.6;
+  float live = mix(1.0, smoother(uDissolve, uDissolve * ${FADE_OUT.toFixed(1)}, edge), uHasUser);
+  // Where the player has been before: stays cleared, with the same soft, slightly wispy edge.
+  vec2 mw = w + (big - 0.5) * uDissolve * 0.5;
+  float seen = texture2D(uExplored, (mw + ${(MASK_SPAN / 2).toFixed(1)}) / ${MASK_SPAN.toFixed(1)}).r;
+  float cover = min(live, 1.0 - smoothstep(0.1, 0.9, seen));
 
   // A big soft glow in the protein's color, centered near (not on) each hidden protein.
   vec3 acc = vec3(0.0);
@@ -111,8 +129,9 @@ void main() {
     if (i >= uCount) break;
     float r = uHint[i].z;
     float dist = length(w - uHint[i].xy) + (big - 0.5) * r * 0.35;
-    float g = 1.0 - smoothstep(0.0, r, dist);
-    g = g * g * (3.0 - 2.0 * g);
+    // A wide, gentle bell: strongest in the middle and fading gradually all the way out to the radius.
+    float x = clamp(dist / r, 0.0, 1.0);
+    float g = max(0.0, (exp(-2.6 * x * x) - 0.0743) / 0.9257);
     acc += uHintColor[i] * g;
     wsum += g;
   }
@@ -190,10 +209,53 @@ export function CloudLayer(props: Props) {
     const u = {
       tl: at('uTL'), tr: at('uTR'), bl: at('uBL'), br: at('uBR'),
       time: at('uTime'), dissolve: at('uDissolve'), opacity: at('uOpacity'), hasUser: at('uHasUser'),
-      user: at('uUser'), count: at('uCount'), hint: at('uHint[0]'), hintColor: at('uHintColor[0]'),
+      user: at('uUser'), count: at('uCount'), hint: at('uHint[0]'), hintColor: at('uHintColor[0]'), explored: at('uExplored'),
     };
     const hintData = new Float32Array(MAX_HINTS * 4);
     const colorData = new Float32Array(MAX_HINTS * 3);
+
+    // The explored mask: a grey-scale picture of the ground the player has cleared, drawn once per new square.
+    const maskCanvas = document.createElement('canvas');
+    maskCanvas.width = maskCanvas.height = MASK_SIZE;
+    const maskCtx = maskCanvas.getContext('2d');
+    const maskTexture = gl.createTexture();
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, maskTexture);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.uniform1i(u.explored, 0);
+    let maskRadius = -1;
+    let maskResets = -1;
+    let maskVersion = -1;
+    const blank = () => {
+      if (!maskCtx) return;
+      maskCtx.globalCompositeOperation = 'source-over';
+      maskCtx.fillStyle = '#000';
+      maskCtx.fillRect(0, 0, MASK_SIZE, MASK_SIZE);
+      maskCtx.globalCompositeOperation = 'lighten'; // overlapping circles keep the brighter (more cleared) value
+    };
+    blank();
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, maskCanvas);
+    const stamp = (cx: number, cy: number, radius: number, cellMeters: number) => {
+      if (!maskCtx) return;
+      const scale = MASK_SIZE / MASK_SPAN;
+      const x = ((cx + 0.5) * cellMeters + MASK_SPAN / 2) * scale;
+      const y = (MASK_SPAN / 2 - (cy + 0.5) * cellMeters) * scale;
+      const r = radius * FADE_OUT * scale;
+      const g = maskCtx.createRadialGradient(x, y, 0, x, y, r);
+      // Clear out to the dissolve radius, then an eased fade to nothing at FADE_OUT times that.
+      const clear = 1 / FADE_OUT;
+      g.addColorStop(0, '#fff');
+      g.addColorStop(clear, '#fff');
+      [[0.12, '#ebebeb'], [0.32, '#b8b8b8'], [0.55, '#666'], [0.78, '#242424'], [1, '#000']].forEach(([t, color]) =>
+        g.addColorStop(clear + (1 - clear) * (t as number), color as string),
+      );
+      maskCtx.fillStyle = g;
+      maskCtx.fillRect(x - r, y - r, r * 2, r * 2);
+    };
     const reduceMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false;
     const speed = reduceMotion ? 0.15 : 1;
     const shown: [number, number] = [0, 0]; // the player's position as drawn: eases toward the real one
@@ -260,6 +322,28 @@ export function CloudLayer(props: Props) {
       gl.uniform4fv(u.hint, hintData);
       gl.uniform3fv(u.hintColor, colorData);
 
+      // Bring the explored mask up to date: everything again if the radius changed or squares were just loaded,
+      // otherwise only the squares added since the last frame.
+      const store = p.explored;
+      let maskDirty = false;
+      if (store && (maskRadius !== p.dissolveRadius || maskResets !== store.resets)) {
+        blank();
+        for (const [cx, cy] of store.all()) stamp(cx, cy, p.dissolveRadius, store.cellMeters);
+        store.takeFresh();
+        maskRadius = p.dissolveRadius;
+        maskResets = store.resets;
+        maskVersion = store.version;
+        maskDirty = true;
+      } else if (store && maskVersion !== store.version) {
+        for (const [cx, cy] of store.takeFresh()) stamp(cx, cy, p.dissolveRadius, store.cellMeters);
+        maskVersion = store.version;
+        maskDirty = true;
+      }
+      if (maskDirty) {
+        gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, maskCanvas);
+      }
+
       gl.clear(gl.COLOR_BUFFER_BIT);
       gl.drawArrays(gl.TRIANGLES, 0, 3);
     };
@@ -270,6 +354,7 @@ export function CloudLayer(props: Props) {
     return () => {
       cancelAnimationFrame(frame);
       gl.deleteBuffer(buffer);
+      gl.deleteTexture(maskTexture);
       gl.deleteProgram(program);
       gl.deleteShader(vertex);
       gl.deleteShader(fragment);
